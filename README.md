@@ -201,38 +201,6 @@ npm test          # 即 node --test，43 项：单元测试 + 起真实服务的
 - 浏览器扩展的 `host_permissions` 只有 `http://127.0.0.1/*` 与 `http://localhost/*`，不申请 `<all_urls>`；剪藏只取你选中的文字、页面标题、链接与图片地址
 - 默认只监听 `127.0.0.1`。改成 `HOST=0.0.0.0` 会暴露到局域网，且这个服务没有鉴权，请自行斟酌
 
-## 开源发布
-
-想让仓库只含代码、不带个人数据，用白名单同步脚本产出发布副本：
-
-```bash
-node tools/publish.mjs --dest <发布目录> --dry   # 先看会复制哪些文件
-node tools/publish.mjs --dest <发布目录> --force
-```
-
-脚本只复制 `INCLUDE` 白名单里的条目（server.js、lib、public、extension、tools、test、README、LICENSE、.gitignore、.github），`data/` 与 `notes/` 在 `NEVER` 黑名单里，任何情况下都不会被复制；目标目录里已有的 `data/`、`notes/` 也不会被删除，只会在 stderr 报警。`test/publish.test.js` 会把这几条不变量当测试跑。
-
-发布前检查清单：
-
-1. `node --test` 全绿（CI 里 ubuntu + windows × Node 20 + 22 也会跑一遍）
-2. 到发布副本里 `git status --ignored`，确认 `data/`、`notes/` 显示为 ignored 而不是 untracked
-3. 全文搜一遍自己的敏感词（项目名、客户名、内部域名），确认没写进 README 或示例数据；`docs/screenshots/` 里的截图也要看一眼——任务标题和笔记摘要会被拍进去，建议用 `TODO_SEED=1` 起一个临时演示库来截图
-4. 用 `TODO_SEED=1 node server.js` 起一次，确认演示数据里没有真实内容
-5. 确认 `LICENSE` 的年份与署名。许可证由发布仓库自己维护（`tools/publish.mjs` 不复制 LICENSE），署名一旦进公开历史就收不回，先想清楚用真实姓名还是 GitHub 昵称
-6. 提交邮箱会随公开历史永久可见：本仓库初始提交用的是 `ffukk@qq.com`（GitHub 网页端生成），而从本机继续提交会用全局配置的邮箱。不想暴露的话，在仓库里单独设置 GitHub 提供的 noreply 邮箱：`git config user.email <数字+用户名@users.noreply.github.com>`（只影响这个仓库）
-7. 推送。已经 clone 好远端仓库的话只需：
-   ```bash
-   cd <发布目录>
-   git add . && git commit -m "feat: 本地任务与笔记 v1" && git push
-   ```
-   全新仓库则：
-   ```bash
-   cd <发布目录>
-   git init -b main && git add . && git commit -m "init: 本地任务与笔记"
-   git remote add origin https://github.com/<你的账号>/<仓库名>.git
-   git push -u origin main
-   ```
-
 ## 常见问题
 
 - **端口被占用**：`PORT=9000 node server.js`
