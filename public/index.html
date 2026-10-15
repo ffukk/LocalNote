@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>本地任务与笔记</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#2f6fed" />
+    <meta name="description" content="只在本机运行的待办、任务与 Markdown 笔记工具" />
+    <link rel="icon" href="/icons/icon-32.png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="logo">✓</span>
+          <div>
+            <h1>本地任务</h1>
+            <p id="clock" class="clock"></p>
+          </div>
+        </div>
+        <nav id="views" class="nav"></nav>
+        <div class="side-block">
+          <div class="side-head">
+            <span>项目</span>
+            <button id="add-project" class="ghost" title="新建项目">＋</button>
+          </div>
+          <ul id="projects" class="side-list"></ul>
+        </div>
+        <div class="side-block">
+          <div class="side-head"><span>标签</span></div>
+          <div id="tags" class="tag-cloud"></div>
+        </div>
+        <div class="side-foot">
+          <button id="install-btn" class="ghost small" hidden>安装为桌面应用</button>
+          <button id="notify-btn" class="ghost small">开启系统通知</button>
+          <a class="ghost small" href="/api/export">备份数据 JSON</a>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div id="reminders" class="reminders"></div>
+        <header class="topbar">
+          <div class="tabs" id="tabs"></div>
+          <div class="top-tools">
+            <input id="search" class="search" type="search" placeholder="搜索标题 / 备注 / 标签" />
+            <select id="sort" class="field">
+              <option value="smart">智能排序</option>
+              <option value="priority">按优先级</option>
+              <option value="due">按到期日</option>
+              <option value="created">按创建时间</option>
+            </select>
+          </div>
+        </header>
+        <section id="content" class="content"></section>
+      </main>
+
+      <aside id="drawer" class="drawer" hidden></aside>
+    </div>
+    <div id="toast" class="toast" hidden></div>
+    <input type="file" id="note-file-input" multiple accept=".md,.markdown,.txt" hidden />
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

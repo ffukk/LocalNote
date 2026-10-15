@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "本地任务剪藏",
+  "version": "1.0.0",
+  "description": "右键把选中的文字、页面链接或图片剪藏到本机「本地任务与笔记」的笔记里",
+  "icons": { "32": "icons/icon-32.png", "192": "icons/icon-192.png" },
+  "action": {
+    "default_title": "本地任务剪藏",
+    "default_popup": "options.html"
+  },
+  "options_page": "options.html",
+  "background": { "service_worker": "background.js" },
+  "permissions": ["contextMenus", "notifications", "storage"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"]
+}

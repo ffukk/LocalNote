@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>本地任务剪藏设置</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <h1>本地任务剪藏</h1>
+    <p class="hint">右键菜单把网页内容追加到本机笔记里。扩展不直接读写磁盘，全部通过本地服务完成。</p>
+
+    <form id="form">
+      <label>
+        本地服务地址
+        <input type="text" id="baseUrl" placeholder="http://127.0.0.1:8787" spellcheck="false" autocomplete="off" />
+      </label>
+      <label>
+        剪藏写入的笔记标题
+        <input type="text" id="note" placeholder="网页剪藏" spellcheck="false" autocomplete="off" />
+      </label>
+      <div class="row">
+        <button type="submit" class="primary">保存</button>
+        <button type="button" id="test">测试连接</button>
+        <a id="open" class="ghost" href="#" target="_blank" rel="noreferrer">打开主界面</a>
+      </div>
+    </form>
+
+    <p id="status" class="status"></p>
+
+    <h2>右键菜单</h2>
+    <ul class="menus">
+      <li><b>剪藏选中文字到笔记</b>：先选中一段文字再点右键</li>
+      <li><b>剪藏本页链接到笔记</b>：只存标题与网址</li>
+      <li><b>剪藏图片到笔记</b>：在图片上点右键，记录图片地址</li>
+      <li><b>打开本地任务与笔记</b>：点工具栏图标直达</li>
+    </ul>
+    <p class="hint">剪藏结果按时间顺序追加到该笔记末尾，可在主界面的「笔记」标签里查看和继续编辑。</p>
+
+    <script src="options.js"></script>
+  </body>
+</html>

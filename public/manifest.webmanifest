@@ -1,0 +1,42 @@
+{
+  "name": "本地任务与笔记",
+  "short_name": "本地任务",
+  "description": "只在本机运行的待办、任务与 Markdown 笔记工具",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f5f7fb",
+  "theme_color": "#2f6fed",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    {
+      "name": "新建任务",
+      "short_name": "任务",
+      "url": "/?new=task",
+      "description": "直接打开新建任务表单",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "新建笔记",
+      "short_name": "笔记",
+      "url": "/?new=note",
+      "description": "直接进入笔记编辑器并新建一条",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "阶段回顾",
+      "short_name": "回顾",
+      "url": "/?view=review",
+      "description": "打开本周回顾",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ]
+}

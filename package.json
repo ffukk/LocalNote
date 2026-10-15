@@ -1,0 +1,17 @@
+{
+  "name": "local-task-system",
+  "version": "1.0.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "本地待办事项 / 任务与 Markdown 笔记系统：零依赖 Node 服务 + 浏览器界面 + 单文件 JSON 与 Markdown 存储",
+  "keywords": ["todo", "task-management", "notes", "markdown", "pwa", "local-first", "zero-dependency", "chrome-extension"],
+  "scripts": {
+    "start": "node server.js",
+    "icons": "node tools/make-icons.mjs",
+    "publish:sync": "node tools/publish.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
