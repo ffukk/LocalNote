@@ -10,6 +10,6 @@
   },
   "options_page": "options.html",
   "background": { "service_worker": "background.js" },
-  "permissions": ["contextMenus", "notifications", "storage"],
+  "permissions": ["contextMenus", "notifications", "storage", "alarms"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"]
 }

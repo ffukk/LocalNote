@@ -58,8 +58,8 @@ test("复制结果是纯代码，且不含任何用户数据", async () => {
   assert.ok(files.includes("extension/manifest.json"));
   assert.ok(files.includes("public/manifest.webmanifest"));
   assert.ok(files.includes(".github/workflows/ci.yml"));
-  assert.equal(files.filter((f) => f.startsWith("lib/")).length, 6);
-  assert.equal(files.filter((f) => f.startsWith("test/")).length, 5);
+  assert.equal(files.filter((f) => f.startsWith("lib/")).length, 7);
+  assert.equal(files.filter((f) => f.startsWith("test/")).length, 6);
 
   for (const forbidden of ["data", "notes", "node_modules", "Python"]) {
     assert.equal(

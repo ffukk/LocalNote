@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize, resolve } from "node:path";
+import { dirname, extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { JsonStore, DEFAULT_SETTINGS } from "./lib/store.js";
@@ -20,6 +20,7 @@ import {
 import { buildReview, buildStats } from "./lib/stats.js";
 import { isValidTimeISO } from "./lib/time.js";
 import { NotesLibrary } from "./lib/notes.js";
+import { BackupManager } from "./lib/backup.js";
 
 const ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const DATA_FILE = process.env.TODO_DATA_FILE ? resolve(process.env.TODO_DATA_FILE) : join(ROOT, "data", "tasks.json");
@@ -42,6 +43,13 @@ const MIME = {
 
 const store = new JsonStore(DATA_FILE);
 const notes = new NotesLibrary(NOTES_DIR);
+const backups = new BackupManager({
+  dataFile: DATA_FILE,
+  notesDir: NOTES_DIR,
+  backupsDir: process.env.TODO_BACKUP_DIR ? resolve(process.env.TODO_BACKUP_DIR) : join(dirname(DATA_FILE), "backups"),
+});
+store.onWrite = () => backups.snapshotIfStale();
+notes.onWrite = () => backups.snapshotIfStale();
 
 function download(res, name, text) {
   send(res, 200, text, {
@@ -163,6 +171,10 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (req.method === "GET" && path === "/api/backups") {
+    return send(res, 200, { dir: backups.backupsDir, keepDays: backups.keepDays, backups: await backups.list() });
+  }
+
   if (seg[1] === "settings" && req.method === "POST") {
     const body = await readBody(req);
     const settings = await store.update((data) => {
@@ -243,7 +255,7 @@ async function handleApi(req, res, url) {
 
     if (seg.length === 2 && req.method === "GET") {
       const result = await notes.list(filter);
-      return send(res, 200, { ...result, dir: notes.dir });
+      return send(res, 200, { ...result, dir: notes.dir, trashCount: (await notes.listTrash()).length });
     }
     if (seg.length === 2 && req.method === "POST") {
       const entry = await notes.create(await readBody(req));
@@ -270,7 +282,20 @@ async function handleApi(req, res, url) {
       return send(res, 201, { note: result.note, created: result.created, dir: notes.dir });
     }
 
-    const id = seg[2];
+    // 回收站路由要放在通用 id 之前；名为 trash 的笔记仍可用它的 n_ id 访问
+    if (seg[2] === "trash") {
+      if (req.method === "GET" && seg.length === 3) return send(res, 200, { items: await notes.listTrash() });
+      const trashId = decodeURIComponent(seg[3] ?? "");
+      if (!trashId) throw new TaskError("缺少回收站条目", 404);
+      if (seg[4] === "restore" && req.method === "POST") {
+        const entry = await notes.restoreTrash(trashId);
+        return send(res, 200, { note: entry.note, body: entry.body });
+      }
+      if (seg[4] === "purge" && req.method === "POST") return send(res, 200, await notes.purgeTrash(trashId));
+      throw new TaskError(`未知接口: ${req.method} ${path}`, 404);
+    }
+
+    const id = decodeURIComponent(seg[2]);
     if (!id) throw new TaskError("缺少笔记 id", 404);
 
     if (seg[3] === "export" && req.method === "GET") {

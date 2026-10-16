@@ -125,13 +125,34 @@ test("列表排序、筛选与命中片段", async () => {
   assert.equal(pinnedNote.note.pinned, true);
 });
 
-test("删除、单条导出与合集导出", async () => {
+test("删除进回收站、可恢复、可彻底删除；单条与合集导出不受影响", async () => {
   const { lib, dir } = await freshLib();
   const a = await lib.create({ title: "待删除", body: "x" });
   await lib.create({ title: "保留", body: "内容保留", tags: ["归档"] });
-  await lib.remove(a.note.id);
-  assert.deepEqual(await readdir(dir), ["保留.md"]);
+  const removed = await lib.remove(a.note.id);
+  assert.equal(removed.removed, a.note.id);
+  assert.match(removed.trash, /^\d{8}-\d{6}__待删除\.md$/, removed.trash);
+  assert.deepEqual((await readdir(dir)).filter((f) => f.endsWith(".md")), ["保留.md"], "主目录只剩保留的笔记");
   await assert.rejects(() => lib.get(a.note.id), NotesError);
+  assert.equal((await lib.list()).total, 1, "回收站内容不出现在列表");
+
+  const trash = await lib.listTrash();
+  assert.equal(trash.length, 1);
+  assert.equal(trash[0].title, "待删除");
+  assert.ok(trash[0].deletedAt, "记录删除时间");
+
+  const restored = await lib.restoreTrash(trash[0].trashFile);
+  assert.equal(restored.note.title, "待删除");
+  assert.equal(restored.body, "x");
+  assert.deepEqual((await readdir(dir)).filter((f) => f.endsWith(".md")).sort(), ["保留.md", "待删除.md"]);
+  assert.equal((await lib.listTrash()).length, 0);
+
+  const again = await lib.create({ title: "再删一次", body: "y" });
+  await lib.remove(again.note.id);
+  const purged = await lib.purgeTrash((await lib.listTrash())[0].trashFile);
+  assert.match(purged.purged, /再删一次/);
+  assert.equal((await lib.listTrash()).length, 0);
+  await assert.rejects(() => lib.purgeTrash("不存在"), /回收站/);
 
   const one = await lib.exportOne("保留");
   assert.equal(one.name, "保留.md");
@@ -139,10 +160,30 @@ test("删除、单条导出与合集导出", async () => {
 
   const all = await lib.exportAll();
   assert.match(all.name, /^notes-\d{4}-\d{2}-\d{2}\.md$/);
-  assert.equal(all.count, 1);
-  assert.match(all.text, /笔记合集（1 条）/);
-  assert.match(all.text, /- \[保留\]\(#保留\)/);
+  assert.equal(all.count, 2, "恢复后的两条都在合集里");
+  assert.match(all.text, /笔记合集（2 条）/);
   assert.match(all.text, /内容保留/);
+});
+
+test("回收站按保留天数清理，且只认带时间戳的文件", async () => {
+  const { lib, dir } = await freshLib();
+  const note = await lib.create({ title: "过期条目", body: "z" });
+  const old = new Date(Date.now() - 9 * 86_400_000);
+  await lib.remove(note.note.id, old);
+  const fresh = await lib.create({ title: "新条目", body: "w" });
+  await lib.remove(fresh.note.id);
+
+  const trashDir = join(dir, "_trash");
+  await writeFile(join(trashDir, "手工放的.md"), "# 手工\n\n不该被清理");
+
+  // 第二次 remove 已触发自动清理：超期条目不该还在
+  assert.deepEqual((await lib.listTrash()).map((t) => t.originalFile).sort(), ["手工放的", "新条目"], "超期条目在删除时已被自动清理");
+  const removed = await lib.pruneTrash(new Date(), 7);
+  assert.deepEqual(removed, [], "手动再清理应无新增删除");
+  const left = (await readdir(trashDir)).sort();
+  assert.equal(left.length, 2);
+  assert.ok(left.some((f) => f.includes("新条目")) && left.includes("手工放的.md"), left.join(","));
+  assert.equal((await lib.listTrash()).length, 2, "无戳文件也能列出（删除时间未知）");
 });
 
 test("导入：识别中文名、跳过重复与非 Markdown", async () => {

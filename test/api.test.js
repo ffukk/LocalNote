@@ -228,6 +228,21 @@ test("笔记接口完整链路：增查改删、搜索、导入导出", async ()
   const files = (await readdir(notesDir)).filter((f) => f.endsWith(".md"));
   assert.equal(files.includes("季度复盘 v2.md"), false, "删除应移除对应 .md 文件");
   assert.equal(files.includes("外部笔记.md"), true);
+
+  const trash = await ok("/api/notes/trash");
+  assert.equal(trash.items.length, 1);
+  assert.equal(trash.items[0].title, "季度复盘 v2");
+  const restored = await ok(`/api/notes/trash/${trash.items[0].trashFile}/restore`, { method: "POST" });
+  assert.equal(restored.note.title, "季度复盘 v2");
+  assert.equal((await ok("/api/notes/trash")).items.length, 0);
+
+  await ok(`/api/notes/${restored.note.id}`, { method: "DELETE" });
+  const listed = await ok("/api/notes/trash");
+  const purged = await ok(`/api/notes/trash/${listed.items[0].trashFile}/purge`, { method: "POST" });
+  assert.match(purged.purged, /季度复盘/);
+  assert.equal((await ok("/api/notes/trash")).items.length, 0);
+  const missingTrash = await call("/api/notes/trash/不存在的文件.md/purge", { method: "POST" });
+  assert.equal(missingTrash.status, 404);
 });
 
 test("PWA：manifest、图标与服务脚本可被浏览器取用", async () => {
@@ -300,6 +315,16 @@ test("剪藏端点：建笔记、追加与空内容拒绝", async () => {
 
   const removed = await ok(`/api/notes/${first.note.id}`, { method: "DELETE" });
   assert.equal(removed.removed, first.note.id);
+});
+
+test("自动备份：当天首次写入后快照可见", async () => {
+  const res = await ok("/api/backups");
+  assert.equal(res.keepDays, 7);
+  assert.match(res.dir, /backups$/);
+  assert.ok(res.backups.length >= 1, "前面的写入应已触发当天快照");
+  const today = res.backups[0];
+  assert.match(today.date, /^\d{4}-\d{2}-\d{2}$/);
+  assert.ok(today.files >= 1 && today.bytes > 0, JSON.stringify(today));
 });
 
 test("未知接口返回 404 JSON", async () => {

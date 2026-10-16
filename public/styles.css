@@ -255,3 +255,8 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .note-side { max-height: none; }
   .note-editor { min-height: 60vh; }
 }
+
+/* 笔记回收站 */
+.note-item.trash { background: #fdf3f3; border-color: #f3d0d0; }
+.note-item.trash .note-item-tags { gap: 6px; }
+.note-side-head .active-chip { background: #e8effd; border-color: var(--brand); color: var(--brand); font-weight: 600; }

@@ -101,7 +101,7 @@ const state = {
   reviewPreset: "week",
   reviewStart: "",
   reviewEnd: "",
-  notes: { list: null, q: "", tag: "", pinned: "", currentId: null, current: null, title: "", tagsText: "", body: "", dirty: false, mode: "split" },
+  notes: { list: null, q: "", tag: "", pinned: "", currentId: null, current: null, title: "", tagsText: "", body: "", dirty: false, mode: "split", showTrash: false, trash: [], lastSave: "manual" },
   reminders: [],
 };
 
@@ -820,8 +820,25 @@ async function renderReviewView() {
 }
 
 /* ---------------- 设置视图 ---------------- */
-function renderSettingsView() {
+async function renderSettingsView() {
   const s = state.data.settings;
+  const backupInfo = await api("/api/backups").catch(() => null);
+  const backupPanel = el("div", { class: "panel", style: "max-width:560px;margin-top:14px" }, [
+    el("h3", {}, ["自动备份", el("span", { class: "hint", text: backupInfo ? `保留 ${backupInfo.keepDays} 天 · ${backupInfo.dir}` : "读取失败" })]),
+    backupInfo && backupInfo.backups.length
+      ? el("table", { class: "data" }, [
+          el("tr", {}, [el("th", { text: "日期" }), el("th", { text: "文件数", class: "num" }), el("th", { text: "大小", class: "num" })]),
+          ...backupInfo.backups.map((b) =>
+            el("tr", {}, [
+              el("td", { text: b.date }),
+              el("td", { class: "num", text: b.files }),
+              el("td", { class: "num", text: `${Math.max(1, Math.round(b.bytes / 1024))} KB` }),
+            ])
+          ),
+        ])
+      : el("div", { class: "hint", text: "还没有快照。当天第一次保存任务或笔记时会自动生成一份。" }),
+    el("div", { class: "hint", text: "快照取的是「当天第一次写入之前」的状态，所以今天误删的内容能在昨天的快照里找回。恢复：停掉服务，把对应日期目录里的 tasks.json 与 notes/ 拷回原位。" }),
+  ]);
   $("#content").replaceChildren(
     el("div", { class: "panel", style: "max-width:560px" }, [
       el("h3", {}, ["提醒与周期"]),
@@ -858,7 +875,8 @@ function renderSettingsView() {
         ]),
         el("div", { class: "hint", text: "数据保存在本机 data/tasks.json（可用文本编辑器直接查看）。停止服务：在终端按 Ctrl+C。" }),
       ]),
-    ])
+    ]),
+    backupPanel
   );
 }
 
@@ -921,8 +939,17 @@ function syncCurrentNote() {
 function markNoteDirty() {
   if (!state.notes.dirty) {
     state.notes.dirty = true;
-    if (noteRefs?.hint) noteRefs.hint.textContent = "未保存 · Ctrl+S 保存";
+    if (noteRefs?.hint) noteRefs.hint.textContent = "未保存 · 2 秒后自动保存";
   }
+  scheduleAutoSave();
+}
+
+let autoSaveTimer = null;
+function scheduleAutoSave() {
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(() => {
+    if (state.notes.dirty && state.notes.currentId) saveNote({ silent: true });
+  }, 2000);
 }
 
 async function openNote(id) {
@@ -952,8 +979,9 @@ async function newNote() {
   noteRefs?.title?.focus();
 }
 
-async function saveNote() {
+async function saveNote({ silent = false } = {}) {
   if (!state.notes.currentId) return;
+  clearTimeout(autoSaveTimer);
   await runNotes(async () => {
     const res = await api(`/api/notes/${state.notes.currentId}`, {
       method: "PATCH",
@@ -961,7 +989,8 @@ async function saveNote() {
     });
     state.notes.current = res.note;
     state.notes.dirty = false;
-    toast("笔记已保存");
+    state.notes.lastSave = silent ? "auto" : "manual";
+    if (!silent) toast("笔记已保存");
   });
 }
 
@@ -970,7 +999,7 @@ async function toggleNotePin(note) {
 }
 
 async function deleteNote(note) {
-  if (!confirm(`删除笔记「${note.title}」？\n对应文件 notes/${note.file}.md 会被移除，不可恢复。`)) return;
+  if (!confirm(`删除笔记「${note.title}」？\n会移入回收站（notes/_trash/），7 天内可恢复。`)) return;
   await runNotes(async () => {
     await api(`/api/notes/${note.id}`, { method: "DELETE" });
     if (state.notes.currentId === note.id) {
@@ -979,7 +1008,22 @@ async function deleteNote(note) {
       state.notes.body = "";
       state.notes.dirty = false;
     }
-    toast("笔记已删除");
+    toast("已移入回收站，7 天内可恢复");
+  });
+}
+
+async function restoreTrash(item) {
+  await runNotes(async () => {
+    await api(`/api/notes/trash/${encodeURIComponent(item.trashFile)}/restore`, { method: "POST" });
+    toast(`已恢复「${item.title}」`);
+  });
+}
+
+async function purgeTrash(item) {
+  if (!confirm(`彻底删除「${item.title}」？\n文件将从回收站移除，不可恢复。`)) return;
+  await runNotes(async () => {
+    await api(`/api/notes/trash/${encodeURIComponent(item.trashFile)}/purge`, { method: "POST" });
+    toast("已彻底删除");
   });
 }
 
@@ -1017,6 +1061,15 @@ function noteListPane() {
     el("div", { class: "note-side-head" }, [
       el("button", { class: "primary", text: "＋ 新建笔记", onclick: newNote }),
       el("button", { class: "ghost small", text: "导入 .md", onclick: () => $("#note-file-input").click() }),
+      el("button", {
+        class: state.notes.showTrash ? "ghost small active-chip" : "ghost small",
+        text: `回收站${state.notes.list?.trashCount ? ` ${state.notes.list.trashCount}` : ""}`,
+        title: "删除的笔记保留 7 天",
+        onclick: () => {
+          state.notes.showTrash = !state.notes.showTrash;
+          render();
+        },
+      }),
     ]),
     search,
     el("div", { class: "tag-cloud note-tags" }, [
@@ -1030,6 +1083,20 @@ function noteListPane() {
 }
 
 function noteListItems() {
+  if (state.notes.showTrash) {
+    const trash = state.notes.trash ?? [];
+    if (!trash.length) return [el("div", { class: "empty", text: "回收站是空的" })];
+    return trash.map((item) =>
+      el("div", { class: "note-item trash" }, [
+        el("div", { class: "note-item-title" }, el("span", { text: item.title })),
+        el("div", { class: "note-item-sub", text: `删除于 ${(item.deletedAt ?? "").slice(0, 16).replace("T", " ")} · ${item.words} 字` }),
+        el("div", { class: "note-item-tags" }, [
+          el("button", { class: "ghost small", text: "恢复", onclick: () => restoreTrash(item) }),
+          el("button", { class: "danger", text: "彻底删除", onclick: () => purgeTrash(item) }),
+        ]),
+      ])
+    );
+  }
   const list = state.notes.list?.notes ?? [];
   if (!list.length) return [el("div", { class: "empty", text: state.notes.q ? "没有匹配的笔记" : "还没有笔记，点「新建笔记」或导入 .md 文件" })];
   return list.map((note) => {
@@ -1105,7 +1172,13 @@ function noteEditorPane() {
       el("button", { class: "ghost", text: "导出全部", onclick: () => { window.location.href = `/api/notes/export/all?${notesQuery()}`; } }),
       el("button", { class: "danger", text: "删除", onclick: () => deleteNote(note) }),
       modes,
-      el("span", { class: "hint", id: "note-hint", text: state.notes.dirty ? "未保存 · Ctrl+S 保存" : `已保存 · ${(note.updatedAt ?? "").slice(0, 16).replace("T", " ")}` }),
+      el("span", {
+        class: "hint",
+        id: "note-hint",
+        text: state.notes.dirty
+          ? "未保存 · 2 秒后自动保存"
+          : `${state.notes.lastSave === "auto" ? "已自动保存" : "已保存"} · ${(note.updatedAt ?? "").slice(0, 16).replace("T", " ")}`,
+      }),
     ]),
     body,
     el("div", { class: "meta note-foot" }, [
@@ -1124,6 +1197,7 @@ function countChars(text) {
 
 async function renderNotesView() {
   if (!state.notes.list) await loadNotes();
+  if (state.notes.showTrash) state.notes.trash = (await api("/api/notes/trash").catch(() => ({ items: [] }))).items;
   noteRefs = null;
   const wrap = el("div", { class: "notes" }, [noteListPane(), noteEditorPane()]);
   noteRefs = {
@@ -1156,7 +1230,7 @@ async function render() {
     else if (state.tab === "notes") content.replaceChildren(await renderNotesView());
     else if (state.tab === "stats") await renderStatsView();
     else if (state.tab === "review") await renderReviewView();
-    else renderSettingsView();
+    else await renderSettingsView();
   } catch (error) {
     // 视图数据要过网络；失败时就地给出原因，不让界面静默停在原处
     content.replaceChildren(el("div", { class: "empty" }, `视图加载失败：${error.message}`));

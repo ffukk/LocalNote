@@ -16,14 +16,16 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 function loadBackground(chrome, fetchImpl) {
   const src = readFileSync(join(ROOT, "extension/background.js"), "utf8");
   const factory = new Function("chrome", "fetch", `${src}
-;return { handleMenu, registerMenus, getSettings, buildPayload, MENUS };`);
+;return { handleMenu, registerMenus, getSettings, buildPayload, refreshBadge, MENUS };`);
   return factory(chrome, fetchImpl);
 }
 
-function mockChrome(storage = {}) {
+function mockChrome(storage = {}, { tabUrls = [] } = {}) {
   const menus = [];
   const notifications = [];
   const tabs = [];
+  const badges = [];
+  const alarms = [];
   const handlers = {};
   const chrome = {
     storage: {
@@ -45,13 +47,24 @@ function mockChrome(storage = {}) {
       clear: (id) => notifications.push({ id, cleared: true }),
       onClicked: { addListener: (fn) => (handlers.notificationClicked = fn) },
     },
-    tabs: { create: (options) => tabs.push(options) },
+    tabs: {
+      create: (options) => tabs.push(options),
+      query: async () => tabUrls.map((url) => ({ url })),
+    },
+    action: {
+      setBadgeText: (options) => badges.push(options.text),
+      setBadgeBackgroundColor: () => {},
+    },
+    alarms: {
+      create: (name, options) => alarms.push({ name, ...options }),
+      onAlarm: { addListener: (fn) => (handlers.alarm = fn) },
+    },
     runtime: {
       onInstalled: { addListener: (fn) => (handlers.installed = fn) },
       onStartup: { addListener: (fn) => (handlers.startup = fn) },
     },
   };
-  return { chrome, menus, notifications, tabs, handlers };
+  return { chrome, menus, notifications, tabs, badges, alarms, handlers };
 }
 
 let server;
@@ -78,7 +91,7 @@ test("manifest 是合规的 MV3 且只申请必要权限", () => {
   const manifest = JSON.parse(readFileSync(join(ROOT, "extension/manifest.json"), "utf8"));
   assert.equal(manifest.manifest_version, 3);
   assert.equal(typeof manifest.background.service_worker, "string");
-  assert.deepEqual(manifest.permissions.sort(), ["contextMenus", "notifications", "storage"]);
+  assert.deepEqual(manifest.permissions.sort(), ["alarms", "contextMenus", "notifications", "storage"]);
   assert.deepEqual(
     manifest.host_permissions,
     ["http://127.0.0.1/*", "http://localhost/*"],
@@ -159,6 +172,69 @@ test("剪藏写入指定的目标笔记", async () => {
   assert.ok(titles.includes("取货单参考"), JSON.stringify(titles));
   const note = list.notes.find((n) => n.title === "取货单参考");
   assert.equal(note.file, "取货单参考");
+});
+
+function localDate(offsetDays = 0) {
+  const d = new Date(Date.now() + offsetDays * 86_400_000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+async function makeDueTask(title) {
+  const res = await fetch(`${baseUrl}/api/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title, due: localDate(), dueTime: "00:01", remindMinutes: 0 }),
+  });
+  return (await res.json()).task;
+}
+
+async function dropTask(id) {
+  await fetch(`${baseUrl}/api/tasks/${id}/trash`, { method: "POST" });
+  await fetch(`${baseUrl}/api/tasks/${id}/purge`, { method: "POST" });
+}
+
+test("角标显示待提醒数量，并注册 5 分钟定时", async () => {
+  const task = await makeDueTask("角标验证任务");
+  const mock = mockChrome({ baseUrl });
+  const bg = loadBackground(mock.chrome, fetch);
+  const result = await bg.refreshBadge();
+  assert.equal(result.online, true);
+  assert.ok(result.count >= 1, JSON.stringify(result));
+  assert.equal(mock.badges.at(-1), String(result.count), "角标数字应等于待提醒条数");
+  assert.ok(mock.alarms.some((a) => a.name === "local-task-remind" && a.periodInMinutes === 5), "应注册定时刷新");
+  assert.equal(typeof mock.handlers.alarm, "function", "应监听 alarm");
+  assert.ok(mock.notifications.length >= 1, "加载时或刷新时应发系统通知");
+  assert.ok(mock.notifications.every((n) => /提醒|逾期/.test(n.title)), mock.notifications.map((n) => n.title).join(","));
+  await dropTask(task.id);
+});
+
+test("同一批提醒不重复通知；应用页面开着时完全不通知", async () => {
+  const task = await makeDueTask("重复通知验证");
+  const storage = { baseUrl };
+  const mock = mockChrome(storage);
+  const bg = loadBackground(mock.chrome, fetch);
+  await bg.refreshBadge(); // 加载时已跑过一次
+  const second = await bg.refreshBadge();
+  assert.equal(second.notified, 0, "已通知过的不再重复");
+  const firstCount = mock.notifications.length;
+  await bg.refreshBadge();
+  assert.equal(mock.notifications.length, firstCount, "第三次仍不该新增通知");
+
+  const withTab = mockChrome({ baseUrl }, { tabUrls: [`${baseUrl}/?view=notes`] });
+  const bg2 = loadBackground(withTab.chrome, fetch);
+  const result = await bg2.refreshBadge();
+  assert.equal(result.notified, 0, "页面开着时由页面自己提醒");
+  assert.equal(withTab.notifications.length, 0);
+  assert.equal(withTab.badges.at(-1), String(result.count), "角标仍然更新");
+  await dropTask(task.id);
+});
+
+test("服务不可达时角标变 ! 且不影响剪藏提示", async () => {
+  const mock = mockChrome({ baseUrl: "http://127.0.0.1:1" });
+  const bg = loadBackground(mock.chrome, fetch);
+  const result = await bg.refreshBadge();
+  assert.deepEqual(result, { online: false, count: 0 });
+  assert.equal(mock.badges.at(-1), "!");
 });
 
 test("点击剪藏成功的通知会打开笔记页", async () => {
