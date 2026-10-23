@@ -217,6 +217,7 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .note-head { display: flex; gap: 8px; }
 .note-title { flex: 2; font-size: 15px; font-weight: 600; }
 .note-tags-input { flex: 1; }
+#note-recovery[hidden] { display: none; }
 .note-toolbar { margin-bottom: 0; }
 .note-toolbar .seg { display: flex; gap: 3px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 3px; }
 .note-toolbar .seg button { border: 0; background: transparent; padding: 4px 10px; border-radius: 7px; cursor: pointer; font-size: 12px; }

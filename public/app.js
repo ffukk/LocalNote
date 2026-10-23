@@ -30,7 +30,12 @@ async function api(path, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(data?.error ?? `${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const error = new Error(data?.error ?? `${res.status} ${res.statusText}`);
+    error.status = res.status;
+    error.code = data?.code;
+    throw error;
+  }
   return data;
 }
 
@@ -101,7 +106,7 @@ const state = {
   reviewPreset: "week",
   reviewStart: "",
   reviewEnd: "",
-  notes: { list: null, q: "", tag: "", pinned: "", currentId: null, current: null, title: "", tagsText: "", body: "", dirty: false, mode: "split", showTrash: false, trash: [], lastSave: "manual" },
+  notes: { list: null, q: "", tag: "", pinned: "", currentId: null, current: null, title: "", tagsText: "", body: "", dirty: false, mode: "split", showTrash: false, trash: [], lastSave: "manual", editVersion: 0, saving: false, saveError: "", conflict: false },
   reminders: [],
 };
 
@@ -820,24 +825,65 @@ async function renderReviewView() {
 }
 
 /* ---------------- 设置视图 ---------------- */
+async function previewBackup(date, target, button) {
+  button.disabled = true;
+  target.textContent = "正在校验备份…";
+  try {
+    const preview = await api(`/api/backups/${encodeURIComponent(date)}/preview`);
+    const recover = el("button", {
+      class: "primary", text: "确认生成恢复副本", onclick: async () => {
+        recover.disabled = true;
+        cancel.disabled = true;
+        try {
+          const result = await api(`/api/backups/${encodeURIComponent(date)}/recover`, {
+            method: "POST", body: { fingerprint: preview.fingerprint },
+          });
+          target.replaceChildren(
+            el("p", { text: `恢复副本已生成：${result.dir}` }),
+            el("p", { text: "现有任务和笔记未修改。请先检查副本；如需替换，请停止本地服务并另存现有数据后再操作。" })
+          );
+        } catch (error) {
+          target.textContent = `恢复失败：${error.message}。现有数据未修改，请重新预览后再试。`;
+        }
+      },
+    });
+    const cancel = el("button", { class: "ghost", text: "取消", onclick: () => target.replaceChildren() });
+    target.replaceChildren(
+      el("p", { text: `${preview.date} · ${preview.taskCount} 个任务 · ${preview.noteCount} 篇笔记 · ${preview.trashCount} 条回收站记录 · ${preview.files} 个文件` }),
+      el("p", { text: preview.verified ? "文件完整性校验通过。将生成独立恢复副本，不覆盖现有数据。" : "这是旧版备份：文件可读取，但没有创建时的校验清单，无法证明原始完整性。仅生成副本供检查。" }),
+      el("div", { class: "pick" }, [recover, cancel])
+    );
+  } catch (error) {
+    target.textContent = `备份校验失败：${error.message}。未生成恢复副本。`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function renderSettingsView() {
   const s = state.data.settings;
   const backupInfo = await api("/api/backups").catch(() => null);
-  const backupPanel = el("div", { class: "panel", style: "max-width:560px;margin-top:14px" }, [
-    el("h3", {}, ["自动备份", el("span", { class: "hint", text: backupInfo ? `保留 ${backupInfo.keepDays} 天 · ${backupInfo.dir}` : "读取失败" })]),
+  const backupResult = el("div", { id: "backup-result", class: "hint", style: "overflow-wrap:anywhere;margin-top:12px", role: "status" });
+  const backupPanel = el("div", { class: "panel", style: "max-width:800px;margin-top:14px;overflow-wrap:anywhere" }, [
+    el("h3", {}, ["自动备份", el("span", { class: "hint", text: backupInfo ? `保留 ${backupInfo.keepDays} 天 · ${backupInfo.dir}` : "读取失败，请刷新重试" })]),
     backupInfo && backupInfo.backups.length
       ? el("table", { class: "data" }, [
-          el("tr", {}, [el("th", { text: "日期" }), el("th", { text: "文件数", class: "num" }), el("th", { text: "大小", class: "num" })]),
+          el("tr", {}, [el("th", { text: "日期" }), el("th", { text: "文件数", class: "num" }), el("th", { text: "大小", class: "num" }), el("th", { text: "校验 / 恢复" })]),
           ...backupInfo.backups.map((b) =>
             el("tr", {}, [
               el("td", { text: b.date }),
               el("td", { class: "num", text: b.files }),
               el("td", { class: "num", text: `${Math.max(1, Math.round(b.bytes / 1024))} KB` }),
+              el("td", {}, [
+                el("span", { text: b.verified ? "已校验 " : "未通过完整性校验 " }),
+                el("button", { class: "ghost small", text: "恢复预览", onclick: (event) => previewBackup(b.date, backupResult, event.currentTarget) }),
+              ]),
             ])
           ),
         ])
-      : el("div", { class: "hint", text: "还没有快照。当天第一次保存任务或笔记时会自动生成一份。" }),
-    el("div", { class: "hint", text: "快照取的是「当天第一次写入之前」的状态，所以今天误删的内容能在昨天的快照里找回。恢复：停掉服务，把对应日期目录里的 tasks.json 与 notes/ 拷回原位。" }),
+      : el("div", { class: "hint", text: backupInfo ? "还没有快照。当天第一次修改任务或笔记前会自动生成一份。" : "无法读取备份列表，不代表没有备份。" }),
+    el("div", { class: "hint", text: "快照保留当天首次修改前的状态，并非实时历史。恢复预览会校验文件，确认后只生成独立副本，不覆盖正在使用的数据；旧版无校验清单的备份不会自动清理。" }),
+    backupResult,
   ]);
   $("#content").replaceChildren(
     el("div", { class: "panel", style: "max-width:560px" }, [
@@ -918,98 +964,198 @@ async function runNotes(action) {
   }
 }
 
-/** PATCH 之后用刷新出的列表回写当前笔记元数据，避免工具栏状态滞后。 */
 function syncCurrentNote() {
-  if (!state.notes.currentId) return;
-  const fresh = state.notes.list?.notes.find((n) => n.id === state.notes.currentId) ?? null;
-  if (!fresh) {
-    state.notes.currentId = null;
-    state.notes.current = null;
-    state.notes.body = "";
-    state.notes.dirty = false;
-    return;
-  }
-  state.notes.current = fresh;
-  if (!state.notes.dirty) {
-    state.notes.title = fresh.title;
-    state.notes.tagsText = (fresh.tags ?? []).join(", ");
-  }
+  const fresh = state.notes.list?.notes.find((n) => n.id === state.notes.currentId);
+  // 列表可能被筛选或来自其它写入，不能替代当前正文对应的版本基线。
+  if (fresh && fresh.revision === state.notes.current?.revision) state.notes.current = fresh;
 }
 
-function markNoteDirty() {
-  if (!state.notes.dirty) {
-    state.notes.dirty = true;
-    if (noteRefs?.hint) noteRefs.hint.textContent = "未保存 · 2 秒后自动保存";
-  }
-  scheduleAutoSave();
+function noteStatusText() {
+  const n = state.notes;
+  if (n.saveError) return `未保存 · ${n.saveError}`;
+  if (n.saving) return "正在保存…继续输入的内容也会保存";
+  if (n.dirty) return "未保存 · 2 秒后自动保存";
+  return `${n.lastSave === "auto" ? "已自动保存" : "已保存"} · ${(n.current?.updatedAt ?? "").slice(0, 16).replace("T", " ")}`;
+}
+
+function updateNoteStatus() {
+  if (noteRefs?.id !== state.notes.currentId) return;
+  if (noteRefs.hint) noteRefs.hint.textContent = noteStatusText();
+  if (noteRefs.recovery) noteRefs.recovery.hidden = !state.notes.saveError;
+  if (noteRefs.file) noteRefs.file.textContent = `文件：notes/${state.notes.current.file}.md`;
 }
 
 let autoSaveTimer = null;
+let saveFlight = null;
+let noteSession = 0;
+let noteNavigating = false;
+let noteComposing = false;
+let noteDeleting = false;
+
+function markNoteDirty() {
+  state.notes.editVersion += 1;
+  state.notes.dirty = true;
+  if (!state.notes.conflict) state.notes.saveError = "";
+  updateNoteStatus();
+  scheduleAutoSave();
+}
+
 function scheduleAutoSave() {
   clearTimeout(autoSaveTimer);
+  if (noteComposing || noteDeleting || state.notes.conflict) return;
   autoSaveTimer = setTimeout(() => {
     if (state.notes.dirty && state.notes.currentId) saveNote({ silent: true });
   }, 2000);
 }
 
+function setCurrentNote(data) {
+  clearTimeout(autoSaveTimer);
+  noteSession += 1;
+  Object.assign(state.notes, {
+    currentId: data?.note.id ?? null, current: data?.note ?? null,
+    title: data?.note.title ?? "", tagsText: (data?.note.tags ?? []).join(", "), body: data?.body ?? "",
+    dirty: false, editVersion: 0, saveError: "", conflict: false, lastSave: "manual",
+  });
+}
+
+async function changeNote(load) {
+  if (noteNavigating) return;
+  noteNavigating = true;
+  try {
+    if (!(await saveNote({ silent: true }))) return;
+    const data = await load();
+    await loadNotes();
+    if (!(await saveNote({ silent: true }))) return;
+    setCurrentNote(data);
+    state.notes.showTrash = false;
+    await render();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    noteNavigating = false;
+  }
+}
+
 async function openNote(id) {
-  if (state.notes.dirty && !confirm("当前笔记有未保存的修改，切换后会丢弃，确定？")) return;
-  const data = await api(`/api/notes/${id}`);
-  state.notes.currentId = data.note.id;
-  state.notes.current = data.note;
-  state.notes.title = data.note.title;
-  state.notes.tagsText = (data.note.tags ?? []).join(", ");
-  state.notes.body = data.body;
-  state.notes.dirty = false;
-  await render();
+  if (id === state.notes.currentId) return;
+  await changeNote(() => api(`/api/notes/${encodeURIComponent(id)}`));
 }
 
 async function newNote() {
-  if (state.notes.dirty && !confirm("当前笔记有未保存的修改，新建会丢弃，确定？")) return;
-  await runNotes(async () => {
-    const res = await api("/api/notes", { method: "POST", body: { title: "未命名笔记", body: "" } });
-    state.notes.currentId = res.note.id;
-    state.notes.current = res.note;
-    state.notes.title = res.note.title;
-    state.notes.tagsText = "";
-    state.notes.body = res.body ?? "";
-    state.notes.dirty = false;
-    state.notes.mode = "split";
-  });
+  await changeNote(() => api("/api/notes", { method: "POST", body: { title: "未命名笔记", body: "" } }));
   noteRefs?.title?.focus();
 }
 
 async function saveNote({ silent = false } = {}) {
-  if (!state.notes.currentId) return;
   clearTimeout(autoSaveTimer);
-  await runNotes(async () => {
-    const res = await api(`/api/notes/${state.notes.currentId}`, {
-      method: "PATCH",
-      body: { title: state.notes.title, tags: state.notes.tagsText, body: state.notes.body },
-    });
-    state.notes.current = res.note;
-    state.notes.dirty = false;
-    state.notes.lastSave = silent ? "auto" : "manual";
-    if (!silent) toast("笔记已保存");
-  });
+  if (saveFlight) return saveFlight;
+  if (!state.notes.currentId || !state.notes.dirty) return true;
+  if (noteComposing || noteDeleting || state.notes.conflict) return false;
+  const id = state.notes.currentId;
+  const session = noteSession;
+  state.notes.saving = true;
+  state.notes.saveError = "";
+  updateNoteStatus();
+  saveFlight = (async () => {
+    try {
+      while (state.notes.currentId === id && noteSession === session && state.notes.dirty) {
+        if (noteComposing) return false;
+        const version = state.notes.editVersion;
+        const res = await api(`/api/notes/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          body: { title: state.notes.title, tags: state.notes.tagsText, body: state.notes.body, baseRevision: state.notes.current.revision },
+        });
+        if (state.notes.currentId !== id || noteSession !== session) return true;
+        state.notes.current = res.note;
+        state.notes.dirty = state.notes.editVersion !== version;
+        state.notes.lastSave = silent ? "auto" : "manual";
+        updateNoteStatus();
+      }
+      if (!silent) toast("笔记已保存");
+      loadNotes().then(() => {
+        if (state.tab === "notes" && noteRefs?.list) noteRefs.list.replaceChildren(...noteListItems());
+      }).catch((error) => toast(`正文已保存，列表刷新失败：${error.message}`, true));
+      return true;
+    } catch (error) {
+      if (state.notes.currentId === id && noteSession === session) {
+        state.notes.saveError = error.code === "NOTE_CONFLICT"
+          ? "版本冲突，草稿已保留；请下载草稿后重新载入"
+          : `${error.message}；草稿已保留，可重试保存`;
+        state.notes.conflict = error.code === "NOTE_CONFLICT";
+      }
+      toast(error.message, true);
+      return false;
+    } finally {
+      state.notes.saving = false;
+      saveFlight = null;
+      updateNoteStatus();
+    }
+  })();
+  return saveFlight;
+}
+
+function downloadNoteDraft() {
+  const text = `# ${state.notes.title}\n\n${state.notes.tagsText ? `标签：${state.notes.tagsText}\n\n` : ""}${state.notes.body}`;
+  const url = URL.createObjectURL(new Blob([text], { type: "text/markdown;charset=utf-8" }));
+  const link = el("a", { href: url, download: "笔记草稿.md" });
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function reloadNote() {
+  if (noteNavigating || !confirm("重新载入会丢弃当前草稿，请先下载草稿留存。确定继续？")) return;
+  noteNavigating = true;
+  try {
+    if (saveFlight) await saveFlight;
+    const id = state.notes.currentId;
+    const version = state.notes.editVersion;
+    const data = await api(`/api/notes/${encodeURIComponent(id)}`);
+    if (version !== state.notes.editVersion) return toast("载入期间有新输入，已保留草稿，请重试", true);
+    setCurrentNote(data);
+    await render();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    noteNavigating = false;
+  }
 }
 
 async function toggleNotePin(note) {
-  await runNotes(() => api(`/api/notes/${note.id}`, { method: "PATCH", body: { pinned: !note.pinned } }));
+  if (!(await saveNote({ silent: true }))) return;
+  await runNotes(async () => {
+    const res = await api(`/api/notes/${encodeURIComponent(note.id)}`, {
+      method: "PATCH", body: { pinned: !note.pinned, baseRevision: state.notes.current?.revision },
+    });
+    if (state.notes.currentId === note.id) state.notes.current = res.note;
+  });
 }
 
 async function deleteNote(note) {
-  if (!confirm(`删除笔记「${note.title}」？\n会移入回收站（notes/_trash/），7 天内可恢复。`)) return;
-  await runNotes(async () => {
-    await api(`/api/notes/${note.id}`, { method: "DELETE" });
+  if (noteNavigating || !confirm(`删除笔记「${note.title}」？\n会先保存当前草稿，再移入回收站，7 天内可恢复。`)) return;
+  noteNavigating = true;
+  try {
+    if (!(await saveNote({ silent: true }))) return;
+    const version = state.notes.editVersion;
+    noteDeleting = true;
+    await api(`/api/notes/${encodeURIComponent(note.id)}`, { method: "DELETE" });
     if (state.notes.currentId === note.id) {
-      state.notes.currentId = null;
-      state.notes.current = null;
-      state.notes.body = "";
-      state.notes.dirty = false;
+      if (state.notes.editVersion === version) setCurrentNote(null);
+      else {
+        state.notes.saveError = "笔记已移入回收站；删除期间的新输入已保留，请下载草稿";
+        state.notes.conflict = true;
+      }
     }
+    await loadNotes();
+    await render();
     toast("已移入回收站，7 天内可恢复");
-  });
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    noteNavigating = false;
+    noteDeleting = false;
+    if (state.notes.dirty) scheduleAutoSave();
+    updateNoteStatus();
+  }
 }
 
 async function restoreTrash(item) {
@@ -1073,9 +1219,9 @@ function noteListPane() {
     ]),
     search,
     el("div", { class: "tag-cloud note-tags" }, [
-      el("button", { class: state.notes.tag === "" ? "active" : "", text: "全部", onclick: () => { state.notes.tag = ""; render(); } }),
+      el("button", { class: state.notes.tag === "" ? "active" : "", text: "全部", onclick: () => runNotes(() => { state.notes.tag = ""; }) }),
       ...(state.notes.list?.tags ?? []).map((tag) =>
-        el("button", { class: state.notes.tag === tag ? "active" : "", text: tag, onclick: () => { state.notes.tag = state.notes.tag === tag ? "" : tag; render(); } })
+        el("button", { class: state.notes.tag === tag ? "active" : "", text: tag, onclick: () => runNotes(() => { state.notes.tag = state.notes.tag === tag ? "" : tag; }) })
       ),
     ]),
     el("div", { class: "note-list", id: "note-list" }, noteListItems()),
@@ -1122,6 +1268,7 @@ function noteEditorPane() {
     ]));
   }
   const note = state.notes.current;
+  const session = noteSession;
   const preview = el("div", { class: "md-body" });
   preview.appendChild(renderMarkdown(state.notes.body));
   const editor = el("textarea", {
@@ -1130,10 +1277,12 @@ function noteEditorPane() {
     value: state.notes.body,
     spellcheck: "false",
     oninput: (e) => {
+      if (session !== noteSession) return;
       state.notes.body = e.target.value;
       markNoteDirty();
       clearTimeout(noteEditorPane.timer);
       noteEditorPane.timer = setTimeout(() => {
+        if (session !== noteSession) return;
         preview.replaceChildren(renderMarkdown(state.notes.body));
         if (noteRefs?.words) noteRefs.words.textContent = `${countChars(state.notes.body)} 字`;
       }, 140);
@@ -1150,19 +1299,23 @@ function noteEditorPane() {
         ? el("div", { class: "note-body single" }, preview)
         : el("div", { class: "note-body" }, [editor, preview]);
 
-  return el("div", { class: "note-editor" }, [
+  return el("div", {
+    class: "note-editor",
+    oncompositionstart: () => { if (session !== noteSession) return; noteComposing = true; clearTimeout(autoSaveTimer); },
+    oncompositionend: () => { if (session !== noteSession) return; noteComposing = false; if (state.notes.dirty) scheduleAutoSave(); },
+  }, [
     el("div", { class: "note-head" }, [
       el("input", {
         class: "note-title field",
         value: state.notes.title,
         placeholder: "笔记标题",
-        oninput: (e) => { state.notes.title = e.target.value; markNoteDirty(); },
+        oninput: (e) => { if (session !== noteSession) return; state.notes.title = e.target.value; markNoteDirty(); },
       }),
       el("input", {
         class: "field note-tags-input",
         value: state.notes.tagsText,
         placeholder: "标签，逗号分隔",
-        oninput: (e) => { state.notes.tagsText = e.target.value; markNoteDirty(); },
+        oninput: (e) => { if (session !== noteSession) return; state.notes.tagsText = e.target.value; markNoteDirty(); },
       }),
     ]),
     el("div", { class: "pick note-toolbar" }, [
@@ -1175,15 +1328,17 @@ function noteEditorPane() {
       el("span", {
         class: "hint",
         id: "note-hint",
-        text: state.notes.dirty
-          ? "未保存 · 2 秒后自动保存"
-          : `${state.notes.lastSave === "auto" ? "已自动保存" : "已保存"} · ${(note.updatedAt ?? "").slice(0, 16).replace("T", " ")}`,
+        text: noteStatusText(),
       }),
+    ]),
+    el("div", { id: "note-recovery", class: "pick", hidden: !state.notes.saveError }, [
+      el("button", { class: "ghost", text: "下载当前草稿", onclick: downloadNoteDraft }),
+      el("button", { class: "ghost", text: "重新载入磁盘版本", onclick: reloadNote }),
     ]),
     body,
     el("div", { class: "meta note-foot" }, [
       el("span", { id: "note-words", text: `${countChars(state.notes.body)} 字` }),
-      el("span", { text: `文件：notes/${note.file}.md` }),
+      el("span", { id: "note-file", text: `文件：notes/${note.file}.md` }),
       el("span", { text: `创建：${(note.createdAt ?? "").slice(0, 16).replace("T", " ")}` }),
     ]),
   ]);
@@ -1197,14 +1352,17 @@ function countChars(text) {
 
 async function renderNotesView() {
   if (!state.notes.list) await loadNotes();
-  if (state.notes.showTrash) state.notes.trash = (await api("/api/notes/trash").catch(() => ({ items: [] }))).items;
+  if (state.notes.showTrash) state.notes.trash = (await api("/api/notes/trash")).items;
   noteRefs = null;
   const wrap = el("div", { class: "notes" }, [noteListPane(), noteEditorPane()]);
   noteRefs = {
+    id: state.notes.currentId,
     list: wrap.querySelector("#note-list"),
     hint: wrap.querySelector("#note-hint"),
     title: wrap.querySelector(".note-title"),
     words: wrap.querySelector("#note-words"),
+    file: wrap.querySelector("#note-file"),
+    recovery: wrap.querySelector("#note-recovery"),
   };
   return wrap;
 }
@@ -1307,7 +1465,7 @@ function wire() {
   });
   $("#note-file-input").addEventListener("change", onNoteFiles);
   window.addEventListener("beforeunload", (e) => {
-    if (state.notes.dirty) e.preventDefault();
+    if (state.notes.dirty || state.notes.saving) e.preventDefault();
   });
   window.addEventListener("beforeinstallprompt", (e) => {
     e.preventDefault();

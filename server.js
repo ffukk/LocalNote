@@ -174,6 +174,15 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && path === "/api/backups") {
     return send(res, 200, { dir: backups.backupsDir, keepDays: backups.keepDays, backups: await backups.list() });
   }
+  if (seg[1] === "backups" && seg.length === 4) {
+    const date = decodeURIComponent(seg[2]);
+    if (req.method === "GET" && seg[3] === "preview") return send(res, 200, await backups.preview(date));
+    if (req.method === "POST" && seg[3] === "recover") {
+      if (req.headers.origin && req.headers.origin !== url.origin) throw new TaskError("不允许跨站恢复请求", 403);
+      const body = await readBody(req);
+      return send(res, 201, await backups.recover(date, body.fingerprint));
+    }
+  }
 
   if (seg[1] === "settings" && req.method === "POST") {
     const body = await readBody(req);
@@ -447,7 +456,7 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     const status = Number.isInteger(error?.status) ? error.status : 500;
     if (status >= 500) console.error("[todo]", error);
-    if (!res.headersSent) send(res, status, { error: error.message ?? "服务器内部错误" });
+    if (!res.headersSent) send(res, status, { error: error.message ?? "服务器内部错误", code: error.code });
   }
 });
 

@@ -43,14 +43,20 @@ async function postClip(baseUrl, payload, note) {
   return data;
 }
 
-function notify(id, title, message) {
-  chrome.notifications.create(id, {
-    type: "basic",
-    iconUrl: "icons/icon-192.png",
-    title,
-    message,
-    priority: 0,
-  });
+async function notify(id, title, message) {
+  try {
+    await chrome.notifications.create(id, {
+      type: "basic",
+      iconUrl: "icons/icon-192.png",
+      title,
+      message,
+      priority: 0,
+    });
+    return true;
+  } catch {
+    // 通知失败不等于剪藏失败；提醒条目留待下一轮重试。
+    return false;
+  }
 }
 
 async function fetchJson(url) {
@@ -62,15 +68,39 @@ async function fetchJson(url) {
 /** 应用页面是否开着：开着时由页面自己提醒，避免同一件事弹两次。 */
 async function appTabOpen(baseUrl) {
   try {
+    const app = new URL(baseUrl);
+    const appPath = app.pathname.replace(/\/+$/, "");
     const tabs = await chrome.tabs.query({});
-    return tabs.some((tab) => String(tab.url || "").startsWith(baseUrl));
+    return tabs.some((tab) => {
+      try {
+        const url = new URL(tab.url);
+        return url.origin === app.origin && url.pathname.replace(/\/+$/, "") === appPath;
+      } catch {
+        return false;
+      }
+    });
   } catch {
     return false;
   }
 }
 
+// 只纳入提醒计划字段；标题或 overdue 随时间变化不应导致重复通知。
+function reminderKey(item) {
+  return JSON.stringify([item.id, item.due, item.dueTime, item.dueAt, item.triggerAt, item.remindMinutes]);
+}
+
+let badgeRefresh = null;
+
+/** 启动、alarm 和手动刷新共享同一轮，直到通知与持久化全部完成。 */
+function refreshBadge() {
+  if (!badgeRefresh) {
+    badgeRefresh = refreshBadgeOnce().finally(() => { badgeRefresh = null; });
+  }
+  return badgeRefresh;
+}
+
 /** 定时刷新角标（今日到期/逾期数量），并对新出现的提醒发系统通知。 */
-async function refreshBadge() {
+async function refreshBadgeOnce() {
   const { baseUrl } = await getSettings();
   let reminders;
   try {
@@ -84,16 +114,30 @@ async function refreshBadge() {
   await chrome.action.setBadgeText({ text: reminders.length ? (reminders.length > 99 ? "99+" : String(reminders.length)) : "" });
   await chrome.action.setBadgeBackgroundColor({ color: "#e08600" });
 
-  const stored = await chrome.storage.local.get(["seenReminderIds"]);
-  const seen = Array.isArray(stored.seenReminderIds) ? stored.seenReminderIds : [];
-  const fresh = reminders.filter((r) => !seen.includes(r.id));
+  // 旧 seenReminderIds 含未实际发送的条目，不能迁移为成功记录。
+  const stored = await chrome.storage.local.get(["sentReminderKeysByBaseUrl"]);
+  const byBase = stored.sentReminderKeysByBaseUrl || {};
+  const current = new Map(reminders.map((item) => [reminderKey(item), item]));
+  const previous = Array.isArray(byBase[baseUrl]) ? byBase[baseUrl] : [];
+  const sent = new Set(previous.filter((key) => current.has(key)));
+  const saveSent = () => chrome.storage.local.set({
+    sentReminderKeysByBaseUrl: { ...byBase, [baseUrl]: [...sent] },
+  });
+  const fresh = [...current].filter(([key]) => !sent.has(key));
+  let notified = 0;
   if (fresh.length && !(await appTabOpen(baseUrl))) {
-    for (const item of fresh.slice(0, 3)) {
-      notify(`reminder-${item.id}`, item.overdue ? "任务已逾期" : "任务到期提醒", `${item.title} · ${item.dueTime ? `${item.due} ${item.dueTime}` : item.due}`);
+    for (const [key, item] of fresh.slice(0, 3)) {
+      const created = await notify(`reminder-${item.id}`, item.overdue ? "任务已逾期" : "任务到期提醒", `${item.title} · ${item.dueTime ? `${item.due} ${item.dueTime}` : item.due}`);
+      if (created) {
+        sent.add(key);
+        notified++;
+        // 每成功一条立即保存，后续 create 失败或挂起不会丢掉前面的成功记录。
+        await saveSent();
+      }
     }
   }
-  await chrome.storage.local.set({ seenReminderIds: reminders.map((r) => r.id) });
-  return { online: true, count: reminders.length, notified: fresh.length };
+  if (!notified) await saveSent(); // 清理本服务失效版本，不动其他服务的记录。
+  return { online: true, count: reminders.length, notified };
 }
 
 function scheduleAlarms() {
@@ -109,14 +153,14 @@ async function handleMenu(menuItemId, info, tab) {
   }
   const payload = buildPayload(menuItemId, info, tab);
   if (menuItemId === "clip-selection" && !payload.text) {
-    notify(`clip-${Date.now()}`, "没有可剪藏的文字", "请先选中文本，再点右键菜单");
+    await notify(`clip-${Date.now()}`, "没有可剪藏的文字", "请先选中文本，再点右键菜单");
     return;
   }
   try {
     const data = await postClip(baseUrl, payload, note);
-    notify(`clip-${Date.now()}`, "已剪藏", `${data.note.title}（${data.created ? "新建笔记" : "追加一条"}）`);
+    await notify(`clip-${Date.now()}`, "已剪藏", `${data.note.title}（${data.created ? "新建笔记" : "追加一条"}）`);
   } catch (error) {
-    notify(`clip-${Date.now()}`, "剪藏失败", `${error.message}；确认本机服务在运行（node server.js）`);
+    await notify(`clip-${Date.now()}`, "剪藏失败", `${error.message}；确认本机服务在运行（node server.js）`);
   }
 }
 
@@ -140,7 +184,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 chrome.notifications.onClicked.addListener(async (id) => {
   const { baseUrl } = await getSettings();
-  chrome.tabs.create({ url: `${baseUrl}/?view=notes` });
+  const view = id.startsWith("reminder-") ? "tasks" : "notes";
+  chrome.tabs.create({ url: `${baseUrl}/?view=${view}` });
   chrome.notifications.clear(id);
 });
 

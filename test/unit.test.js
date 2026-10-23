@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import fs, { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -192,4 +193,137 @@ test("JsonStore：落盘、重载与并发写不丢数据", async () => {
 
   await writeFile(file, "{ broken");
   await assert.rejects(() => new JsonStore(file).read(), /解析失败/);
+});
+
+test("JsonStore：业务抛错不污染缓存或磁盘，队列可继续成功", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "todo-store-"));
+  const file = join(dir, "tasks.json");
+  const store = new JsonStore(file);
+  await store.save();
+  const committed = await store.read();
+  await assert.rejects(store.update(async (draft) => {
+    draft.tasks.push({ id: "失败" });
+    draft.settings.weekStart = 0;
+    throw new Error("业务失败");
+  }), /业务失败/);
+  assert.equal(await store.read(), committed, "失败后仍是原已提交对象");
+  assert.equal(committed.tasks.length, 0);
+  assert.equal(committed.settings.weekStart, 1);
+  assert.equal(JSON.parse(await readFile(file, "utf8")).tasks.length, 0);
+  const result = await store.update((draft) => { draft.tasks.push({ id: "成功" }); return "已保存"; });
+  assert.equal(result, "已保存");
+  assert.deepEqual((await store.read()).tasks, [{ id: "成功" }]);
+});
+
+test("JsonStore：保存期间 read 仅返回已提交对象，钩子读取不死锁", { timeout: 5000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "todo-store-"));
+  const file = join(dir, "tasks.json");
+  const store = new JsonStore(file);
+  await store.save();
+  const committed = await store.read();
+  let release;
+  let entered;
+  const started = new Promise((r) => { entered = r; });
+  const gate = new Promise((r) => { release = r; });
+  let hookSnapshot;
+  store.onWrite = async () => { hookSnapshot = await store.read(); entered(); await gate; };
+  const writing = store.update((draft) => { draft.tasks.push({ id: "尚未提交" }); });
+  await started;
+  try {
+    assert.equal(await store.read(), committed);
+    assert.equal(hookSnapshot, committed);
+    assert.deepEqual(committed.tasks, []);
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")).tasks, []);
+  } finally {
+    release();
+    await writing;
+  }
+  assert.notEqual(await store.read(), committed);
+  assert.deepEqual(committed.tasks, [], "提交不能回写此前暴露的对象");
+  assert.deepEqual((await store.read()).tasks, [{ id: "尚未提交" }]);
+});
+
+test("JsonStore：备份失败不提交，read 返回对象仍支持种子修改后 save", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "todo-store-"));
+  const file = join(dir, "tasks.json");
+  const store = new JsonStore(file);
+  const data = await store.read();
+  data.seeded = true;
+  data.tasks.push({ id: "种子" });
+  await store.save();
+  const before = await store.read();
+  const raw = await readFile(file, "utf8");
+  store.onWrite = async () => { throw new Error("备份失败"); };
+  await assert.rejects(store.update((draft) => { draft.tasks.push({ id: "失败" }); }), /备份失败/);
+  assert.equal(await store.read(), before);
+  assert.deepEqual(before.tasks, [{ id: "种子" }]);
+  assert.equal(await readFile(file, "utf8"), raw);
+  store.onWrite = null;
+  await store.update((draft) => { draft.tasks.push({ id: "成功" }); });
+  assert.equal((await store.read()).seeded, true);
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")).tasks, [{ id: "种子" }, { id: "成功" }]);
+});
+
+for (const operation of ["writeFile", "rename"]) {
+  test(`JsonStore：${operation} 失败清理自己的临时文件且不污染缓存`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), "todo-store-"));
+    const file = join(dir, "tasks.json");
+    const store = new JsonStore(file);
+    await store.save();
+    const committed = await store.read();
+    const unrelated = join(dir, "unrelated.tmp");
+    await writeFile(unrelated, "不要删除其他写入的临时文件");
+    const original = fs[operation];
+    let fail = true;
+    t.mock.method(fs, operation, async (...args) => {
+      if (fail && String(args[0]).startsWith(`${file}.`)) {
+        if (operation === "writeFile") await original(args[0], "部分写入", "utf8");
+        throw Object.assign(new Error("模拟磁盘失败"), { code: "EIO" });
+      }
+      return original(...args);
+    });
+    syncBuiltinESMExports();
+    t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+    await assert.rejects(store.update((draft) => { draft.tasks.push({ id: "失败" }); }), /模拟磁盘失败/);
+    assert.equal(await store.read(), committed);
+    assert.deepEqual(committed.tasks, []);
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")).tasks, []);
+    assert.deepEqual((await readdir(dir)).sort(), ["tasks.json", "unrelated.tmp"]);
+    fail = false;
+    await store.update((draft) => { draft.tasks.push({ id: "成功" }); });
+    assert.deepEqual((await store.read()).tasks, [{ id: "成功" }]);
+  });
+}
+
+test("JsonStore：首次并发 read/update 共用加载，加载失败后可重试", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "todo-store-"));
+  const file = join(dir, "tasks.json");
+  await writeFile(file, JSON.stringify(makeData({ tasks: [{ id: "已有" }] })));
+  const store = new JsonStore(file);
+  const originalRead = fs.readFile;
+  let count = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  t.mock.method(fs, "readFile", async (...args) => {
+    if (args[0] === file) { count += 1; await gate; }
+    return originalRead(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const readers = Array.from({ length: 10 }, () => store.read());
+  const writing = store.update((draft) => { draft.tasks.push({ id: "新增" }); });
+  try {
+    assert.equal(count, 1, "首次加载只能读取磁盘一次");
+  } finally {
+    release();
+    await Promise.all([...readers, writing]);
+  }
+  assert.deepEqual((await store.read()).tasks, [{ id: "已有" }, { id: "新增" }]);
+  const brokenFile = join(dir, "broken.json");
+  await writeFile(brokenFile, "{ broken");
+  const broken = new JsonStore(brokenFile);
+  const failures = await Promise.allSettled([broken.read(), broken.read()]);
+  assert.ok(failures.every((r) => r.status === "rejected"));
+  await writeFile(brokenFile, JSON.stringify(makeData()));
+  assert.deepEqual((await broken.read()).tasks, []);
 });
