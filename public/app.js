@@ -644,13 +644,102 @@ async function quickAdd() {
 /* ---------------- 抽屉（详情 / 编辑 / 新建） ---------------- */
 let taskDrawer = null;
 let taskSaving = false;
+const TASK_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const TASK_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+
+function taskNoteImageBytes(src) {
+  const encoded = src.slice(src.indexOf(",") + 1);
+  return encoded.length * 3 / 4 - (encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0);
+}
+
+function safeTaskNoteImage(src) {
+  return typeof src === "string" && src.length <= Math.ceil(TASK_IMAGE_MAX_BYTES / 3) * 4 + 32 &&
+    /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(src);
+}
+
+async function readTaskNoteImage(file) {
+  if (!TASK_IMAGE_TYPES.includes(file.type)) throw new Error("仅支持 PNG、JPEG、GIF、WebP 图片");
+  if (!file.size || file.size > TASK_IMAGE_MAX_BYTES) throw new Error("单张图片须大于 0 且不超过 2 MiB");
+  const src = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reader.onabort = () => reject(new Error("图片读取失败，请重新粘贴"));
+    reader.readAsDataURL(file);
+  });
+  if (!safeTaskNoteImage(src)) throw new Error("图片格式无效");
+  const image = new Image();
+  image.src = src;
+  await image.decode().catch(() => { throw new Error("图片无法解码或已经损坏，请重新粘贴"); });
+  return src;
+}
+
+function showTaskNoteImage(src, index) {
+  if (!safeTaskNoteImage(src)) return;
+  const focus = document.activeElement;
+  const dialog = el("dialog", { class: "task-image-dialog", "aria-label": `备注图片 ${index + 1}`, onkeydown: (event) => {
+    event.stopPropagation();
+    if ((event.ctrlKey || event.metaKey) && ["k", "s"].includes(event.key.toLowerCase())) event.preventDefault();
+  } });
+  const close = () => { dialog.close(); dialog.remove(); if (focus?.isConnected) focus.focus(); };
+  dialog.appendChild(el("button", { class: "ghost", text: "关闭大图", onclick: close }));
+  dialog.appendChild(el("img", { src, alt: `备注图片 ${index + 1}` }));
+  dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+}
+
+function createTaskNoteImages(images, isCurrent) {
+  const initial = [...images];
+  const draft = { images: [...images], pending: false };
+  const list = el("div", { class: "task-note-images", "aria-label": "备注图片" });
+  const status = el("div", { class: "task-image-hint", role: "status", "aria-live": "polite" });
+  draft.element = el("div", {}, [list, status]);
+  draft.changed = () => draft.pending || draft.images.length !== initial.length || draft.images.some((src, i) => src !== initial[i]);
+  const renderImages = () => {
+    list.replaceChildren(...draft.images.map((src, index) => el("div", { class: "task-note-image" }, [
+      safeTaskNoteImage(src) ? el("button", { class: "task-image-thumb", type: "button", "aria-label": `查看备注图片 ${index + 1}`, onclick: () => showTaskNoteImage(src, index) }, el("img", { src, alt: `备注图片 ${index + 1}` })) : el("span", { text: "图片格式无效" }),
+      el("button", { class: "ghost small", type: "button", text: "移除", "aria-label": `移除备注图片 ${index + 1}`, disabled: draft.pending || taskSaving, onclick: () => {
+        if (!isCurrent() || draft.pending || taskSaving) return;
+        draft.images.splice(index, 1);
+        renderImages();
+      } }),
+    ])));
+    status.textContent = draft.pending ? "正在读取图片，请稍候再保存…" : `${draft.images.length}/5 张 · 在备注框粘贴截图，点击图片查看大图；单张最多 2 MiB，总计 4 MiB，随任务保存`;
+  };
+  draft.paste = async (event) => {
+    const files = [...(event.clipboardData?.items ?? [])].filter((item) => item.kind === "file" && item.type.startsWith("image/")).map((item) => item.getAsFile()).filter(Boolean);
+    if (!files.length) return;
+    event.preventDefault();
+    if (!isCurrent() || taskSaving) return;
+    if (draft.pending) return toast("图片正在读取，请稍候再粘贴", true);
+    try {
+      if (draft.images.length + files.length > 5) throw new Error("每条任务最多 5 张备注图片");
+      if (files.some((file) => !file.size || file.size > TASK_IMAGE_MAX_BYTES)) throw new Error("单张图片须大于 0 且不超过 2 MiB");
+      if (draft.images.reduce((sum, src) => sum + taskNoteImageBytes(src), 0) + files.reduce((sum, file) => sum + file.size, 0) > 4 * 1024 * 1024) throw new Error("每条任务的备注图片总计不能超过 4 MiB");
+      draft.pending = true;
+      renderImages();
+      const added = await Promise.all(files.map(readTaskNoteImage));
+      if (isCurrent()) draft.images.push(...added);
+    } catch (error) {
+      if (isCurrent()) toast(error.message, true);
+    } finally {
+      draft.pending = false;
+      if (isCurrent()) renderImages();
+    }
+  };
+  renderImages();
+  return draft;
+}
 
 function openTask(id, opts = {}) {
+  if (taskSaving) return toast("任务正在保存，请稍候", true);
+  if (taskDrawer?.imagesChanged()) return toast("备注图片尚未保存，请先保存或关闭当前任务", true);
   state.selected = { id, addSub: Boolean(opts.addSub) };
   render();
 }
 function closeTask() {
   if (taskSaving) return toast("任务正在保存，请稍候", true);
+  if (taskDrawer?.imagesChanged() && !confirm("备注图片尚未保存，关闭会丢弃本次任务修改，确定关闭？")) return;
   state.selected = null;
   render();
 }
@@ -680,17 +769,19 @@ function renderDrawer() {
   const sourceNoteId = isNew ? state.selected.sourceNoteId : task.sourceNoteId;
 
   const form = el("div", { class: "form" });
+  const selected = state.selected;
+  const imageDraft = createTaskNoteImages(task?.noteImages ?? [], () => state.selected === selected && form.isConnected);
 
   form.appendChild(el("label", {}, ["标题", el("input", { class: "field", id: "f-title", value: task?.title ?? state.selected.prefill ?? "", placeholder: "要做什么" })]));
   if (parent) form.appendChild(el("div", { class: "hint", text: `子任务 · 父任务：${parent.title}` }));
   if (sourceNoteId) form.appendChild(isNew
     ? el("div", { class: "hint", text: `来源笔记：${state.selected.sourceNoteTitle}` })
     : el("button", { class: "ghost", text: "打开来源笔记", onclick: () => {
-        if (taskSaving || JSON.stringify(collect()) !== initialForm) return toast("请先保存任务修改，再打开来源笔记", true);
-        const selected = state.selected;
-        openSourceNote(sourceNoteId, () => state.selected === selected && form.isConnected && JSON.stringify(collect()) === initialForm);
+        if (taskSaving || changed()) return toast("请先保存任务修改，再打开来源笔记", true);
+        openSourceNote(sourceNoteId, () => state.selected === selected && form.isConnected && !changed());
       } }));
-  form.appendChild(el("label", {}, ["备注", el("textarea", { class: "field", id: "f-notes", text: task?.notes ?? state.selected.notesPrefill ?? "" })]));
+  form.appendChild(el("label", {}, ["备注", el("textarea", { class: "field", id: "f-notes", text: task?.notes ?? state.selected.notesPrefill ?? "", placeholder: "填写备注，可直接粘贴截图", onpaste: imageDraft.paste })]));
+  form.appendChild(imageDraft.element);
   form.appendChild(
     el("div", { class: "grid2" }, [
       el("label", {}, ["优先级", selectField("f-priority", Object.entries(PRIORITY_NAME), task?.priority ?? "P2")]),
@@ -778,10 +869,12 @@ function renderDrawer() {
   });
 
   const initialForm = JSON.stringify(collect());
+  const changed = () => imageDraft.changed() || JSON.stringify(collect()) !== initialForm;
   const save = async () => {
     if (taskSaving) return;
+    if (imageDraft.pending) return toast("图片正在读取，请稍候再保存", true);
     taskSaving = true;
-    const body = collect();
+    const body = { ...collect(), noteImages: [...imageDraft.images] };
     const controls = $$("input, textarea, select, button", form);
     controls.forEach((control) => { control.disabled = true; });
     try {
@@ -808,42 +901,45 @@ function renderDrawer() {
     }
   };
   const saveButton = el("button", { class: "primary", text: isNew ? "创建任务" : "保存修改", disabled: taskSaving, onclick: save });
+  const remove = async (purge) => {
+    if (taskSaving) return;
+    if (imageDraft.changed()) return toast("备注图片尚未保存，请先保存或关闭当前任务", true);
+    if (purge && !confirm("彻底删除后无法恢复，确定吗？")) return;
+    if (!purge && children.length && !confirm(`该任务有 ${children.length} 个子任务，将一起移入回收站。`)) return;
+    taskSaving = true;
+    const controls = $$("input, textarea, select, button", form);
+    controls.forEach((control) => { control.disabled = true; });
+    try {
+      await run(async () => {
+        await api(`/api/tasks/${task.id}/${purge ? "purge" : "trash"}`, { method: "POST" });
+        state.selected = null;
+        toast(purge ? "已彻底删除" : "已移入回收站");
+      });
+    } finally {
+      taskSaving = false;
+      controls.forEach((control) => { control.disabled = false; });
+      renderDrawer();
+    }
+  };
 
   form.appendChild(
     el("div", { class: "foot" }, [
       saveButton,
       isNew
         ? null
-        : el("button", { class: "ghost", text: "＋ 添加子任务", onclick: () => { state.selected = { id: "new", parentId: task.id }; render(); } }),
+        : el("button", { class: "ghost", text: "＋ 添加子任务", onclick: () => {
+            if (imageDraft.changed()) return toast("备注图片尚未保存，请先保存当前任务", true);
+            state.selected = { id: "new", parentId: task.id }; render();
+          } }),
       el("span", { style: "flex:1" }),
       task && task.status !== "trashed"
-        ? el("button", {
-            class: "danger",
-            text: "移入回收站",
-            onclick: () =>
-              run(async () => {
-                if (children.length && !confirm(`该任务有 ${children.length} 个子任务，将一起移入回收站。`)) return;
-                await api(`/api/tasks/${task.id}/trash`, { method: "POST" });
-                state.selected = null;
-                toast("已移入回收站");
-              }),
-          })
+        ? el("button", { class: "danger", text: "移入回收站", onclick: () => remove(false) })
         : null,
       task?.status === "trashed"
         ? el("button", { class: "ghost", text: "恢复", onclick: () => run(() => api(`/api/tasks/${task.id}/restore`, { method: "POST" })) })
         : null,
       task?.status === "trashed"
-        ? el("button", {
-            class: "danger",
-            text: "彻底删除",
-            onclick: () =>
-              run(async () => {
-                if (!confirm("彻底删除后无法恢复，确定吗？")) return;
-                await api(`/api/tasks/${task.id}/purge`, { method: "POST" });
-                state.selected = null;
-                toast("已彻底删除");
-              }),
-          })
+        ? el("button", { class: "danger", text: "彻底删除", onclick: () => remove(true) })
         : null,
     ])
   );
@@ -875,7 +971,7 @@ function renderDrawer() {
   }
 
   drawer.replaceChildren(el("h2", {}, [el("button", { class: "close", text: "×", title: "关闭 (Esc)", onclick: closeTask }), isNew ? "新建任务" : "任务详情"]), form);
-  taskDrawer = { selection: state.selected, changed: () => JSON.stringify(collect()) !== initialForm };
+  taskDrawer = { selection: state.selected, changed, imagesChanged: imageDraft.changed };
   if (taskSaving) $$("input, textarea, select, button", form).forEach((control) => { control.disabled = true; });
   if (state.selected.addSub) {
     state.selected.addSub = false;
@@ -2167,7 +2263,7 @@ function wire() {
     if (e.key === null || e.key.startsWith(NOTE_DRAFT_PREFIX)) refreshNoteDrafts();
   });
   window.addEventListener("beforeunload", (e) => {
-    if (state.notes.dirty || state.notes.saving || noteHistory.writing) e.preventDefault();
+    if (state.notes.dirty || state.notes.saving || noteHistory.writing || taskSaving || taskDrawer?.imagesChanged()) e.preventDefault();
   });
   window.addEventListener("beforeinstallprompt", (e) => {
     e.preventDefault();
