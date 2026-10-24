@@ -106,7 +106,7 @@ const state = {
   reviewPreset: "week",
   reviewStart: "",
   reviewEnd: "",
-  notes: { list: null, q: "", tag: "", pinned: "", currentId: null, current: null, title: "", tagsText: "", body: "", dirty: false, mode: "split", showTrash: false, trash: [], lastSave: "manual", editVersion: 0, saving: false, saveError: "", conflict: false },
+  notes: { list: null, q: "", tag: "", pinned: "", currentId: null, current: null, title: "", tagsText: "", body: "", dirty: false, mode: "split", showTrash: false, trash: [], lastSave: "manual", editVersion: 0, saving: false, saveError: "", conflict: false, draftError: "", restoredDraft: false },
   reminders: [],
 };
 
@@ -935,6 +935,166 @@ async function addProject() {
 
 /* ---------------- 笔记模块 ---------------- */
 let noteRefs = null;
+let noteDraftKey = null;
+const NOTE_DRAFT_PREFIX = "localnote:draft:v1:";
+
+function parseNoteDraft(raw) {
+  const draft = JSON.parse(raw);
+  if (!draft || draft.version !== 1 ||
+      !["dir", "noteId", "baseRevision", "title", "tagsText", "body", "savedAt"].every((key) => typeof draft[key] === "string") ||
+      !draft.dir || !draft.noteId.startsWith("n_") || !draft.baseRevision || !Number.isFinite(Date.parse(draft.savedAt))) {
+    throw new Error("草稿格式无效");
+  }
+  return draft;
+}
+
+function persistNoteDraft() {
+  const n = state.notes;
+  if (!n.currentId || !n.dirty) return false;
+  const previous = noteDraftKey;
+  try {
+    if (!n.list?.dir) throw new Error("笔记目录尚未加载");
+    const key = NOTE_DRAFT_PREFIX + crypto.randomUUID();
+    const draft = {
+      version: 1, dir: n.list.dir, noteId: n.currentId, baseRevision: n.current.revision,
+      title: n.title, tagsText: n.tagsText, body: n.body, savedAt: new Date().toISOString(),
+    };
+    // 快照键只写一次；先写新快照再删本页旧快照，避免多标签页互相覆盖。
+    localStorage.setItem(key, JSON.stringify(draft));
+    noteDraftKey = key;
+    n.draftError = "";
+  } catch {
+    n.draftError = "浏览器草稿留存失败（存储不可用或空间不足），请立即保存或下载当前草稿";
+    return false;
+  }
+  try {
+    if (previous) localStorage.removeItem(previous);
+  } catch {
+    n.draftError = "最新草稿已留存，但旧副本清理失败，恢复列表中可能有重复项";
+  }
+  return true;
+}
+
+function clearNoteDraft() {
+  try {
+    if (noteDraftKey) localStorage.removeItem(noteDraftKey);
+    noteDraftKey = null;
+    state.notes.draftError = "";
+    return true;
+  } catch {
+    state.notes.draftError = "浏览器草稿清理失败，旧副本仍可能出现在恢复列表中";
+    return false;
+  }
+}
+
+function readNoteDrafts() {
+  const drafts = [];
+  let error = "";
+  try {
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(NOTE_DRAFT_PREFIX) || key === noteDraftKey) continue;
+      const raw = localStorage.getItem(key);
+      if (raw === null) continue;
+      try {
+        const draft = parseNoteDraft(raw);
+        if (draft.dir === state.notes.list?.dir) drafts.push({ ...draft, key });
+      } catch {
+        error = "部分浏览器草稿格式异常，已保留原记录，未自动删除";
+      }
+    }
+  } catch {
+    error = "无法读取浏览器草稿，可能是存储被禁用；不能确认是否有可恢复内容";
+  }
+  drafts.sort((a, b) => b.savedAt.localeCompare(a.savedAt));
+  return { drafts, error };
+}
+
+function storedNoteDraft(key) {
+  if (typeof key !== "string" || !key.startsWith(NOTE_DRAFT_PREFIX)) throw new Error("无效的草稿记录");
+  const raw = localStorage.getItem(key);
+  if (raw === null) throw new Error("草稿已被其他页面处理，请刷新列表");
+  const draft = parseNoteDraft(raw);
+  if (draft.dir !== state.notes.list?.dir) throw new Error("草稿不属于当前笔记目录");
+  return draft;
+}
+
+function discardNoteDraft(key) {
+  try {
+    if (key === noteDraftKey) throw new Error("不能丢弃正在编辑的草稿，请先保存或重新载入");
+    storedNoteDraft(key);
+    localStorage.removeItem(key);
+    refreshNoteDrafts();
+    return true;
+  } catch (error) {
+    toast(`草稿未丢弃：${error.message}`, true);
+    return false;
+  }
+}
+
+async function recoverNoteDraft(key) {
+  if (noteNavigating) return;
+  noteNavigating = true;
+  try {
+    const draft = storedNoteDraft(key);
+    if (!(await saveNote({ silent: true }))) return;
+    const data = await api(`/api/notes/${encodeURIComponent(draft.noteId)}`);
+    await loadNotes();
+    if (!(await saveNote({ silent: true }))) return;
+    if (draft.dir !== state.notes.list?.dir) throw new Error("笔记目录已变化，草稿未恢复");
+    setCurrentNote(data);
+    Object.assign(state.notes, {
+      title: draft.title, tagsText: draft.tagsText, body: draft.body, dirty: true, editVersion: 1,
+      current: { ...data.note, revision: draft.baseRevision }, restoredDraft: true,
+      conflict: data.note.revision !== draft.baseRevision,
+      saveError: data.note.revision !== draft.baseRevision ? "磁盘版本已变化，已恢复草稿但不会覆盖；请下载草稿后重新载入并合并" : "",
+    });
+    // 原快照可能属于仍在编辑的其他页面，恢复只创建副本，不接管或删除原记录。
+    persistNoteDraft();
+    state.notes.showTrash = false;
+    await render();
+  } catch (error) {
+    toast(error.status === 404 ? "原笔记已不存在；草稿仍保留，可下载或先从回收站恢复笔记" : `草稿未恢复：${error.message}`, true);
+  } finally {
+    noteNavigating = false;
+  }
+}
+
+function noteDraftStatusText() {
+  if (state.notes.draftError) return state.notes.draftError;
+  return state.notes.dirty && noteDraftKey ? "已留存浏览器草稿 · 仅限本机当前浏览器和地址" : "";
+}
+
+function noteDraftItems() {
+  const { drafts, error } = readNoteDrafts();
+  return [
+    error ? el("div", { class: "hint draft-warning", role: "status", text: error }) : null,
+    el("details", { open: drafts.length > 0 }, [
+      el("summary", { text: `待恢复的浏览器草稿 ${drafts.length}` }),
+      el("div", { class: "hint", text: "恢复副本后请检查并手动保存。原草稿可能来自其他打开的页面，因此保留原记录，确认无误后可手动丢弃；原笔记已删除时仍可下载。" }),
+      ...drafts.map((draft) => el("div", { class: "note-draft-item" }, [
+        el("strong", { text: draft.title || "未命名笔记" }),
+        el("div", { class: "note-item-sub", text: new Date(draft.savedAt).toLocaleString("zh-CN", { hour12: false }) }),
+        el("div", { class: "note-item-ex", text: draft.body.slice(0, 160) }),
+        el("div", { class: "note-item-tags" }, [
+          el("button", { class: "ghost small", text: "恢复到编辑器", onclick: () => recoverNoteDraft(draft.key) }),
+          el("button", { class: "ghost small", text: "下载草稿", onclick: () => downloadNoteDraft(draft) }),
+          el("button", { class: "ghost small", text: "丢弃草稿", onclick: (event) => {
+            event.currentTarget.parentElement.replaceChildren(
+              el("span", { class: "hint", text: "只丢弃这份浏览器草稿，不影响磁盘笔记。" }),
+              el("button", { class: "danger", text: "确认丢弃", onclick: () => discardNoteDraft(draft.key) }),
+              el("button", { class: "ghost small", text: "取消", onclick: refreshNoteDrafts })
+            );
+          } }),
+        ]),
+      ])),
+    ]),
+  ].filter(Boolean);
+}
+
+function refreshNoteDrafts() {
+  if (noteRefs?.drafts) noteRefs.drafts.replaceChildren(...noteDraftItems());
+}
 
 function notesQuery() {
   const params = new URLSearchParams();
@@ -974,6 +1134,7 @@ function noteStatusText() {
   const n = state.notes;
   if (n.saveError) return `未保存 · ${n.saveError}`;
   if (n.saving) return "正在保存…继续输入的内容也会保存";
+  if (n.restoredDraft) return "未保存 · 已恢复浏览器草稿，请检查后手动保存";
   if (n.dirty) return "未保存 · 2 秒后自动保存";
   return `${n.lastSave === "auto" ? "已自动保存" : "已保存"} · ${(n.current?.updatedAt ?? "").slice(0, 16).replace("T", " ")}`;
 }
@@ -981,7 +1142,11 @@ function noteStatusText() {
 function updateNoteStatus() {
   if (noteRefs?.id !== state.notes.currentId) return;
   if (noteRefs.hint) noteRefs.hint.textContent = noteStatusText();
-  if (noteRefs.recovery) noteRefs.recovery.hidden = !state.notes.saveError;
+  if (noteRefs.recovery) noteRefs.recovery.hidden = !state.notes.saveError && !state.notes.draftError && !state.notes.restoredDraft;
+  if (noteRefs.draftStatus) {
+    noteRefs.draftStatus.textContent = noteDraftStatusText();
+    noteRefs.draftStatus.classList.toggle("draft-warning", Boolean(state.notes.draftError));
+  }
   if (noteRefs.file) noteRefs.file.textContent = `文件：notes/${state.notes.current.file}.md`;
 }
 
@@ -996,13 +1161,14 @@ function markNoteDirty() {
   state.notes.editVersion += 1;
   state.notes.dirty = true;
   if (!state.notes.conflict) state.notes.saveError = "";
+  persistNoteDraft();
   updateNoteStatus();
   scheduleAutoSave();
 }
 
 function scheduleAutoSave() {
   clearTimeout(autoSaveTimer);
-  if (noteComposing || noteDeleting || state.notes.conflict) return;
+  if (noteComposing || noteDeleting || state.notes.conflict || state.notes.restoredDraft) return;
   autoSaveTimer = setTimeout(() => {
     if (state.notes.dirty && state.notes.currentId) saveNote({ silent: true });
   }, 2000);
@@ -1011,10 +1177,12 @@ function scheduleAutoSave() {
 function setCurrentNote(data) {
   clearTimeout(autoSaveTimer);
   noteSession += 1;
+  noteDraftKey = null;
+  noteComposing = false;
   Object.assign(state.notes, {
     currentId: data?.note.id ?? null, current: data?.note ?? null,
     title: data?.note.title ?? "", tagsText: (data?.note.tags ?? []).join(", "), body: data?.body ?? "",
-    dirty: false, editVersion: 0, saveError: "", conflict: false, lastSave: "manual",
+    dirty: false, editVersion: 0, saveError: "", conflict: false, lastSave: "manual", draftError: "", restoredDraft: false,
   });
 }
 
@@ -1050,7 +1218,8 @@ async function saveNote({ silent = false } = {}) {
   clearTimeout(autoSaveTimer);
   if (saveFlight) return saveFlight;
   if (!state.notes.currentId || !state.notes.dirty) return true;
-  if (noteComposing || noteDeleting || state.notes.conflict) return false;
+  if (noteComposing || noteDeleting || state.notes.conflict || (silent && state.notes.restoredDraft)) return false;
+  persistNoteDraft();
   const id = state.notes.currentId;
   const session = noteSession;
   state.notes.saving = true;
@@ -1069,8 +1238,14 @@ async function saveNote({ silent = false } = {}) {
         state.notes.current = res.note;
         state.notes.dirty = state.notes.editVersion !== version;
         state.notes.lastSave = silent ? "auto" : "manual";
+        if (state.notes.dirty) persistNoteDraft();
+        else {
+          state.notes.restoredDraft = false;
+          clearNoteDraft();
+        }
         updateNoteStatus();
       }
+      refreshNoteDrafts();
       if (!silent) toast("笔记已保存");
       loadNotes().then(() => {
         if (state.tab === "notes" && noteRefs?.list) noteRefs.list.replaceChildren(...noteListItems());
@@ -1094,8 +1269,8 @@ async function saveNote({ silent = false } = {}) {
   return saveFlight;
 }
 
-function downloadNoteDraft() {
-  const text = `# ${state.notes.title}\n\n${state.notes.tagsText ? `标签：${state.notes.tagsText}\n\n` : ""}${state.notes.body}`;
+function downloadNoteDraft(draft = state.notes) {
+  const text = `# ${draft.title}\n\n${draft.tagsText ? `标签：${draft.tagsText}\n\n` : ""}${draft.body}`;
   const url = URL.createObjectURL(new Blob([text], { type: "text/markdown;charset=utf-8" }));
   const link = el("a", { href: url, download: "笔记草稿.md" });
   link.click();
@@ -1111,7 +1286,10 @@ async function reloadNote() {
     const version = state.notes.editVersion;
     const data = await api(`/api/notes/${encodeURIComponent(id)}`);
     if (version !== state.notes.editVersion) return toast("载入期间有新输入，已保留草稿，请重试", true);
+    const cleared = clearNoteDraft();
+    const draftError = state.notes.draftError;
     setCurrentNote(data);
+    if (!cleared) state.notes.draftError = draftError;
     await render();
   } catch (error) {
     toast(error.message, true);
@@ -1218,6 +1396,7 @@ function noteListPane() {
       }),
     ]),
     search,
+    el("div", { id: "note-drafts", class: "note-drafts" }, noteDraftItems()),
     el("div", { class: "tag-cloud note-tags" }, [
       el("button", { class: state.notes.tag === "" ? "active" : "", text: "全部", onclick: () => runNotes(() => { state.notes.tag = ""; }) }),
       ...(state.notes.list?.tags ?? []).map((tag) =>
@@ -1331,8 +1510,9 @@ function noteEditorPane() {
         text: noteStatusText(),
       }),
     ]),
-    el("div", { id: "note-recovery", class: "pick", hidden: !state.notes.saveError }, [
-      el("button", { class: "ghost", text: "下载当前草稿", onclick: downloadNoteDraft }),
+    el("div", { id: "note-draft-status", class: `hint${state.notes.draftError ? " draft-warning" : ""}`, role: "status", text: noteDraftStatusText() }),
+    el("div", { id: "note-recovery", class: "pick", hidden: !state.notes.saveError && !state.notes.draftError && !state.notes.restoredDraft }, [
+      el("button", { class: "ghost", text: "下载当前草稿", onclick: () => downloadNoteDraft() }),
       el("button", { class: "ghost", text: "重新载入磁盘版本", onclick: reloadNote }),
     ]),
     body,
@@ -1363,6 +1543,8 @@ async function renderNotesView() {
     words: wrap.querySelector("#note-words"),
     file: wrap.querySelector("#note-file"),
     recovery: wrap.querySelector("#note-recovery"),
+    drafts: wrap.querySelector("#note-drafts"),
+    draftStatus: wrap.querySelector("#note-draft-status"),
   };
   return wrap;
 }
@@ -1464,6 +1646,9 @@ function wire() {
     }
   });
   $("#note-file-input").addEventListener("change", onNoteFiles);
+  window.addEventListener("storage", (e) => {
+    if (e.key === null || e.key.startsWith(NOTE_DRAFT_PREFIX)) refreshNoteDrafts();
+  });
   window.addEventListener("beforeunload", (e) => {
     if (state.notes.dirty || state.notes.saving) e.preventDefault();
   });
