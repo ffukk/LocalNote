@@ -307,6 +307,18 @@ async function handleApi(req, res, url) {
     const id = decodeURIComponent(seg[2]);
     if (!id) throw new TaskError("缺少笔记 id", 404);
 
+    if (seg[3] === "history") {
+      if (seg.length === 4 && req.method === "GET") return send(res, 200, await notes.listHistory(id));
+      const revision = decodeURIComponent(seg[4] ?? "");
+      if (seg.length === 5 && req.method === "GET") return send(res, 200, await notes.getHistory(id, revision));
+      if (seg.length === 6 && seg[5] === "restore" && req.method === "POST") {
+        const body = await readBody(req);
+        const entry = await notes.restoreHistory(id, revision, body.baseRevision);
+        return send(res, 200, { note: entry.note, body: entry.body });
+      }
+      throw new TaskError(`未知接口: ${req.method} ${path}`, 404);
+    }
+
     if (seg[3] === "export" && req.method === "GET") {
       const file = await notes.exportOne(id);
       return download(res, file.name, file.text);
@@ -322,8 +334,9 @@ async function handleApi(req, res, url) {
   if (seg[1] === "tasks") {
     if (req.method === "POST" && seg.length === 2) {
       const body = await readBody(req);
-      const task = await store.update((data) => {
+      const task = await store.update(async (data) => {
         const created = buildTask(body, now);
+        if (created.sourceNoteId) created.sourceNoteId = (await notes.get(created.sourceNoteId)).note.id;
         if (created.parentId) {
           const parent = data.tasks.find((t) => t.id === created.parentId);
           if (!parent) throw new TaskError("父任务不存在");
@@ -348,8 +361,9 @@ async function handleApi(req, res, url) {
 
     if (req.method === "PATCH") {
       const body = await readBody(req);
-      const task = await store.update((data) => {
+      const task = await store.update(async (data) => {
         const found = findTask(data, id);
+        const sourceNoteIdBefore = found.sourceNoteId;
         const next = { ...body };
         delete next.id;
         if (next.status === "trashed") throw new TaskError("请使用删除操作移入回收站");
@@ -359,6 +373,9 @@ async function handleApi(req, res, url) {
         }
         const scheduleTouched = ["due", "dueTime", "remindMinutes"].some((key) => key in body);
         applyTaskInput(found, next, { creating: false });
+        if (found.sourceNoteId && found.sourceNoteId !== sourceNoteIdBefore) {
+          found.sourceNoteId = (await notes.get(found.sourceNoteId)).note.id;
+        }
         if (found.status === "done" && !found.completedAt) found.completedAt = now.toISOString();
         if (found.status !== "done") found.completedAt = null;
         if (scheduleTouched) found.reminderDismissedAt = null;

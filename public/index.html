@@ -45,7 +45,8 @@
         <header class="topbar">
           <div class="tabs" id="tabs"></div>
           <div class="top-tools">
-            <input id="search" class="search" type="search" placeholder="搜索标题 / 备注 / 标签" />
+            <button id="global-search-open" class="ghost" title="统一搜索任务与笔记（Ctrl/Cmd + K）">统一搜索 <kbd>Ctrl K</kbd></button>
+            <input id="search" class="search field" type="search" aria-label="筛选当前任务视图" placeholder="筛选当前任务视图" />
             <select id="sort" class="field">
               <option value="smart">智能排序</option>
               <option value="priority">按优先级</option>
@@ -59,6 +60,42 @@
 
       <aside id="drawer" class="drawer" hidden></aside>
     </div>
+    <dialog id="global-search-dialog" class="search-dialog" aria-labelledby="global-search-title">
+      <div class="search-head">
+        <h2 id="global-search-title">统一搜索</h2>
+        <button id="global-search-close" class="ghost small" aria-label="关闭统一搜索">关闭</button>
+      </div>
+      <div class="search-input-row">
+        <input id="global-search-input" class="field" type="search" maxlength="80" autocomplete="off" placeholder="搜索任务与笔记的标题、正文、标签" aria-label="搜索任务与笔记" role="combobox" aria-autocomplete="list" aria-controls="global-search-results" aria-expanded="true" />
+        <button id="global-search-clear" class="ghost small">清空搜索</button>
+      </div>
+      <div class="search-meta">
+        <span id="global-search-status" role="status" aria-live="polite"></span>
+        <button id="global-search-clear-recent" class="ghost small">清空最近打开</button>
+      </div>
+      <div id="global-search-error" class="search-message" role="alert"></div>
+      <button id="global-search-retry" class="ghost small" hidden>重试搜索</button>
+      <div id="global-search-results" class="search-results" role="listbox" aria-label="搜索结果"></div>
+      <p class="search-help">↑ ↓ 选择 · Enter 打开 · Esc 关闭；空搜索显示最近打开。不含回收站。</p>
+    </dialog>
+    <dialog id="note-history-dialog" class="note-history-dialog" aria-labelledby="note-history-title">
+      <div class="note-history-head">
+        <h2 id="note-history-title">版本历史</h2>
+        <button id="note-history-close" class="ghost small" aria-label="关闭版本历史">关闭</button>
+      </div>
+      <p class="hint">保存变更前留存旧版本；只读查看不会替换编辑器。恢复前会先保存当前草稿，恢复前的版本也会保留。</p>
+      <div id="note-history-status" role="status" aria-live="polite"></div>
+      <div id="note-history-error" class="search-message" role="alert"></div>
+      <div class="note-history-layout">
+        <nav id="note-history-list" aria-label="历史版本列表"></nav>
+        <section id="note-history-preview" aria-label="历史版本只读预览"></section>
+      </div>
+      <div class="note-history-actions">
+        <button id="note-history-refresh" class="ghost">刷新历史</button>
+        <button id="note-history-restore" class="primary" disabled>恢复此版本</button>
+      </div>
+      <p class="hint">历史仅保存在本机，不自动清理；不记录外部编辑器的每次修改，也不包含此功能启用前的旧稿。</p>
+    </dialog>
     <div id="toast" class="toast" hidden></div>
     <input type="file" id="note-file-input" multiple accept=".md,.markdown,.txt" hidden />
     <script src="/app.js" type="module"></script>

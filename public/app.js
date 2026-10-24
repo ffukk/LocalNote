@@ -110,6 +110,225 @@ const state = {
   reminders: [],
 };
 
+const RECENT_OPENED_KEY = "localnote:recent:v1";
+const searchPanel = { open: false, seq: 0, query: "", results: { tasks: [], notes: [], recent: [] }, items: [], active: 0, loading: false, opening: false, error: "", storageWarning: "", tasksRequest: null };
+let recentMemory = [];
+let recentStorageFailed = false;
+
+function readRecentOpened() {
+  if (recentStorageFailed) return recentMemory;
+  try {
+    const raw = JSON.parse(localStorage.getItem(RECENT_OPENED_KEY) || "[]");
+    if (!Array.isArray(raw)) throw new Error("记录格式错误");
+    const seen = new Set();
+    recentMemory = raw.filter((item) => {
+      if (!item || !["task", "note"].includes(item.kind) || typeof item.id !== "string" || !item.id.trim() || item.id.length > 160) return false;
+      const key = `${item.kind}:${item.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 12).map(({ kind, id }) => ({ kind, id }));
+  } catch {
+    searchPanel.storageWarning = "最近打开无法读取，仅保留本次会话记录";
+    recentStorageFailed = true;
+  }
+  return recentMemory;
+}
+
+function rememberOpened(kind, id) {
+  recentMemory = [{ kind, id }, ...readRecentOpened().filter((item) => item.kind !== kind || item.id !== id)].slice(0, 12);
+  try {
+    localStorage.setItem(RECENT_OPENED_KEY, JSON.stringify(recentMemory));
+    recentStorageFailed = false;
+    searchPanel.storageWarning = "";
+  } catch {
+    recentStorageFailed = true;
+    searchPanel.storageWarning = "最近打开无法保存，仅保留本次会话记录";
+  }
+}
+
+function clearRecentOpened() {
+  recentMemory = [];
+  try {
+    localStorage.removeItem(RECENT_OPENED_KEY);
+    recentStorageFailed = false;
+    searchPanel.storageWarning = "";
+  } catch {
+    recentStorageFailed = true;
+    searchPanel.storageWarning = "浏览器中的记录未能清除，本次会话已隐藏";
+  }
+}
+
+function searchPattern(query) {
+  return new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "giu");
+}
+
+function highlightedText(text, query) {
+  text = String(text ?? "");
+  query = query.trim();
+  if (!query) return [text];
+  const parts = [];
+  let end = 0;
+  for (const match of text.matchAll(searchPattern(query))) {
+    parts.push(text.slice(end, match.index), el("mark", { text: match[0] }));
+    end = match.index + match[0].length;
+  }
+  parts.push(text.slice(end));
+  return parts;
+}
+
+function buildSearchResults(tasks, notes, query, recent) {
+  const keyword = query.trim().toLowerCase();
+  const taskItems = tasks.filter((task) => task.status !== "trashed").map((task) => {
+    const text = task.notes ?? "";
+    const at = keyword ? text.search(searchPattern(query.trim())) : -1;
+    const start = Math.max(0, at - 40);
+    return { kind: "task", id: task.id, title: task.title, tags: task.tags ?? [], status: task.status,
+      text: `${start ? "…" : ""}${text.slice(start, start + 180)}${text.length > start + 180 ? "…" : ""}`,
+      matches: !keyword || `${task.title} ${text} ${(task.tags ?? []).join(" ")}`.toLowerCase().includes(keyword) };
+  });
+  const noteItems = notes.map((note) => ({ kind: "note", id: note.id, title: note.title, text: note.hit || note.excerpt || "", tags: note.tags ?? [] }));
+  const byId = new Map([...taskItems, ...noteItems].map((item) => [`${item.kind}:${item.id}`, item]));
+  return { tasks: taskItems.filter((item) => item.matches), notes: noteItems,
+    recent: keyword ? [] : recent.map((item) => byId.get(`${item.kind}:${item.id}`)).filter(Boolean) };
+}
+
+async function loadGlobalSearch() {
+  const seq = ++searchPanel.seq;
+  const query = searchPanel.query.trim();
+  searchPanel.loading = true;
+  searchPanel.error = "";
+  renderGlobalSearch();
+  searchPanel.tasksRequest ??= api("/api/state");
+  const [tasks, notes] = await Promise.allSettled([searchPanel.tasksRequest, api(`/api/notes?${new URLSearchParams({ q: query })}`)]);
+  if (!searchPanel.open || seq !== searchPanel.seq) return;
+  const errors = [];
+  if (tasks.status === "rejected") errors.push(`任务搜索失败：${tasks.reason.message}`);
+  if (notes.status === "rejected") errors.push(`笔记搜索失败：${notes.reason.message}`);
+  searchPanel.results = buildSearchResults(tasks.status === "fulfilled" ? tasks.value.tasks : [], notes.status === "fulfilled" ? notes.value.notes : [], query, readRecentOpened());
+  searchPanel.error = errors.join("；");
+  searchPanel.loading = false;
+  searchPanel.active = 0;
+  renderGlobalSearch();
+}
+
+function renderGlobalSearch() {
+  if (!searchPanel.open) return;
+  const { results, loading, query } = searchPanel;
+  const groups = query.trim() ? [["任务", results.tasks], ["笔记", results.notes]] : [["最近打开", results.recent]];
+  searchPanel.items = loading ? [] : groups.flatMap(([, items]) => items.slice(0, 20));
+  const count = groups.reduce((total, [, items]) => total + items.length, 0);
+  $("#global-search-status").textContent = loading ? "正在搜索…" : query.trim() ? `找到 ${count} 项 · 不受当前视图筛选限制` : `最近打开 ${count} 项 · 仅保存在此浏览器`;
+  $("#global-search-clear-recent").hidden = Boolean(query.trim());
+  $("#global-search-error").textContent = [searchPanel.error, searchPanel.storageWarning].filter(Boolean).join("；");
+  $("#global-search-retry").hidden = !searchPanel.error || loading;
+  const list = $("#global-search-results");
+  list.setAttribute("aria-busy", String(loading));
+  let index = 0;
+  list.replaceChildren(...(loading ? [] : groups.flatMap(([name, items]) => [
+    el("div", { class: "search-group", role: "presentation", text: `${name} · ${items.length}${items.length > 20 ? "（显示前 20 项，请缩小搜索范围）" : ""}` }),
+    ...items.slice(0, 20).map((item) => {
+      const current = index++;
+      return el("button", { id: `search-result-${current}`, class: "search-result", role: "option", tabindex: "-1", "aria-selected": String(current === searchPanel.active), onclick: () => openSearchResult(item) }, [
+        el("div", { class: "search-result-title" }, [el("strong", {}, highlightedText(item.title, query)), el("span", { class: "pill", text: item.kind === "note" ? "笔记" : `任务 · ${{ todo: "待办", doing: "进行中", done: "已完成" }[item.status] ?? "待办"}` })]),
+        item.text ? el("div", { class: "search-result-text" }, highlightedText(item.text, query)) : null,
+        item.tags.length ? el("div", { class: "search-result-tags" }, item.tags.map((tag) => el("span", { class: "pill" }, highlightedText(`#${tag}`, query)))) : null,
+      ]);
+    }),
+  ])));
+  if (!loading && !searchPanel.items.length) list.appendChild(el("div", { class: "empty", text: searchPanel.error ? "部分结果暂不可用，请重试" : query.trim() ? "没有匹配结果，试试更短的关键词" : "还没有最近打开记录，输入关键词开始搜索" }));
+  updateSearchActive();
+}
+
+function updateSearchActive() {
+  const input = $("#global-search-input");
+  const buttons = $$(".search-result", $("#global-search-results"));
+  buttons.forEach((button, index) => button.setAttribute("aria-selected", String(index === searchPanel.active)));
+  const active = buttons[searchPanel.active];
+  if (active) input.setAttribute("aria-activedescendant", active.id);
+  else input.removeAttribute("aria-activedescendant");
+}
+
+function scheduleGlobalSearch(immediate = false) {
+  clearTimeout(searchPanel.timer);
+  searchPanel.seq++;
+  searchPanel.query = $("#global-search-input").value.slice(0, 80);
+  searchPanel.loading = true;
+  searchPanel.error = "";
+  renderGlobalSearch();
+  if (immediate) void loadGlobalSearch();
+  else searchPanel.timer = setTimeout(loadGlobalSearch, 200);
+}
+
+function showGlobalSearch() {
+  if (!state.data) return;
+  if (!searchPanel.open) {
+    searchPanel.returnFocus = document.activeElement;
+    searchPanel.open = true;
+    searchPanel.tasksRequest = null;
+    searchPanel.query = "";
+    $("#global-search-input").value = "";
+    $("#global-search-dialog").showModal();
+    void loadGlobalSearch();
+  }
+  $("#global-search-input").focus();
+  $("#global-search-input").select();
+}
+
+function closeGlobalSearch() {
+  searchPanel.open = false;
+  searchPanel.composing = false;
+  searchPanel.seq++;
+  clearTimeout(searchPanel.timer);
+  $("#global-search-dialog").close();
+  if (searchPanel.returnFocus?.isConnected) searchPanel.returnFocus.focus();
+}
+
+async function openSearchResult(item) {
+  if (!searchPanel.open || searchPanel.opening) return;
+  if (taskSaving || state.selected?.id === "new" || taskDrawer?.changed() || noteNavigating || noteDeleting) {
+    searchPanel.error = "请先保存或关闭当前任务，或等待笔记操作完成，再打开搜索结果";
+    renderGlobalSearch();
+    return;
+  }
+  const selected = state.selected;
+  const seq = searchPanel.seq;
+  const canNavigate = () => searchPanel.open && seq === searchPanel.seq && state.selected === selected && !taskSaving && !taskDrawer?.changed();
+  searchPanel.opening = true;
+  $("#global-search-status")?.replaceChildren("正在打开…");
+  try {
+    if (item.kind === "task") {
+      const { task } = await api(`/api/tasks/${encodeURIComponent(item.id)}`);
+      if (!canNavigate()) return;
+      if (task.status === "trashed") throw new Error("任务已移入回收站，可先恢复后再打开");
+      const current = state.data.tasks.find((entry) => entry.id === task.id);
+      if (current) Object.assign(current, task);
+      else state.data.tasks.push(task);
+      state.selected = { id: task.id };
+      renderDrawer();
+      rememberOpened("task", task.id);
+    } else {
+      let loadError;
+      const opened = await changeNote(async () => {
+        try { return await api(`/api/notes/${encodeURIComponent(item.id)}`); }
+        catch (error) { loadError = error; throw error; }
+      }, { fromTask: true, canNavigate });
+      if (!opened) {
+        if (!searchPanel.open || seq !== searchPanel.seq) return;
+        throw new Error(loadError?.status === 404 ? "笔记已删除或不存在，可到笔记回收站恢复" : loadError?.message || state.notes.saveError || "当前草稿未保存，请关闭搜索并处理草稿后再试");
+      }
+    }
+    if (!searchPanel.open || seq !== searchPanel.seq) return;
+    closeGlobalSearch();
+    $(item.kind === "task" ? "#f-title" : ".note-title")?.focus();
+  } catch (error) {
+    if (searchPanel.open && seq === searchPanel.seq) searchPanel.error = error.message;
+  } finally {
+    searchPanel.opening = false;
+    renderGlobalSearch();
+  }
+}
+
 const VIEWS = [
   { key: "today", name: "今天" },
   { key: "upcoming", name: "未来 7 天" },
@@ -423,11 +642,15 @@ async function quickAdd() {
 }
 
 /* ---------------- 抽屉（详情 / 编辑 / 新建） ---------------- */
+let taskDrawer = null;
+let taskSaving = false;
+
 function openTask(id, opts = {}) {
   state.selected = { id, addSub: Boolean(opts.addSub) };
   render();
 }
 function closeTask() {
+  if (taskSaving) return toast("任务正在保存，请稍候", true);
   state.selected = null;
   render();
 }
@@ -435,10 +658,12 @@ function closeTask() {
 function renderDrawer() {
   const drawer = $("#drawer");
   if (!state.selected) {
+    taskDrawer = null;
     drawer.hidden = true;
     drawer.replaceChildren();
     return;
   }
+  if (taskDrawer?.selection === state.selected && (taskSaving || taskDrawer.changed())) return;
   drawer.hidden = false;
   const all = [...state.data.tasks, ...state.data.trashed];
   const isNew = state.selected.id === "new";
@@ -447,16 +672,25 @@ function renderDrawer() {
     drawer.replaceChildren(el("div", { class: "empty" }, "任务已不存在"));
     return;
   }
+  if (task && task.status !== "trashed" && taskDrawer?.selection !== state.selected) rememberOpened("task", task.id);
   const repeat = task?.repeat ?? { rule: "none" };
   const parentId = isNew ? state.selected.parentId ?? null : task.parentId;
   const parent = parentId ? all.find((t) => t.id === parentId) : null;
   const children = isNew ? [] : childTasks(task.id);
+  const sourceNoteId = isNew ? state.selected.sourceNoteId : task.sourceNoteId;
 
   const form = el("div", { class: "form" });
 
   form.appendChild(el("label", {}, ["标题", el("input", { class: "field", id: "f-title", value: task?.title ?? state.selected.prefill ?? "", placeholder: "要做什么" })]));
   if (parent) form.appendChild(el("div", { class: "hint", text: `子任务 · 父任务：${parent.title}` }));
-  form.appendChild(el("label", {}, ["备注", el("textarea", { class: "field", id: "f-notes", text: task?.notes ?? "" })]));
+  if (sourceNoteId) form.appendChild(isNew
+    ? el("div", { class: "hint", text: `来源笔记：${state.selected.sourceNoteTitle}` })
+    : el("button", { class: "ghost", text: "打开来源笔记", onclick: () => {
+        if (taskSaving || JSON.stringify(collect()) !== initialForm) return toast("请先保存任务修改，再打开来源笔记", true);
+        const selected = state.selected;
+        openSourceNote(sourceNoteId, () => state.selected === selected && form.isConnected && JSON.stringify(collect()) === initialForm);
+      } }));
+  form.appendChild(el("label", {}, ["备注", el("textarea", { class: "field", id: "f-notes", text: task?.notes ?? state.selected.notesPrefill ?? "" })]));
   form.appendChild(
     el("div", { class: "grid2" }, [
       el("label", {}, ["优先级", selectField("f-priority", Object.entries(PRIORITY_NAME), task?.priority ?? "P2")]),
@@ -543,23 +777,41 @@ function renderDrawer() {
     })(),
   });
 
+  const initialForm = JSON.stringify(collect());
   const save = async () => {
+    if (taskSaving) return;
+    taskSaving = true;
     const body = collect();
-    await run(async () => {
-      if (isNew) {
-        if (parentId) body.parentId = parentId;
-        const res = await api("/api/tasks", { method: "POST", body });
-        state.selected = { id: res.task.id };
-      } else {
-        await api(`/api/tasks/${task.id}`, { method: "PATCH", body });
-      }
-      toast("已保存");
-    });
+    const controls = $$("input, textarea, select, button", form);
+    controls.forEach((control) => { control.disabled = true; });
+    try {
+      await run(async () => {
+        if (isNew) {
+          if (parentId) body.parentId = parentId;
+          if (sourceNoteId) body.sourceNoteId = sourceNoteId;
+          const res = await api("/api/tasks", { method: "POST", body });
+          state.selected = { id: res.task.id };
+          state.data.tasks.push(res.task);
+          taskDrawer = null;
+          renderDrawer();
+        } else {
+          const res = await api(`/api/tasks/${task.id}`, { method: "PATCH", body });
+          Object.assign(task, res.task);
+          taskDrawer = null;
+        }
+        toast("已保存");
+      });
+    } finally {
+      taskSaving = false;
+      controls.forEach((control) => { control.disabled = false; });
+      renderDrawer();
+    }
   };
+  const saveButton = el("button", { class: "primary", text: isNew ? "创建任务" : "保存修改", disabled: taskSaving, onclick: save });
 
   form.appendChild(
     el("div", { class: "foot" }, [
-      el("button", { class: "primary", text: isNew ? "创建任务" : "保存修改", onclick: save }),
+      saveButton,
       isNew
         ? null
         : el("button", { class: "ghost", text: "＋ 添加子任务", onclick: () => { state.selected = { id: "new", parentId: task.id }; render(); } }),
@@ -623,6 +875,8 @@ function renderDrawer() {
   }
 
   drawer.replaceChildren(el("h2", {}, [el("button", { class: "close", text: "×", title: "关闭 (Esc)", onclick: closeTask }), isNew ? "新建任务" : "任务详情"]), form);
+  taskDrawer = { selection: state.selected, changed: () => JSON.stringify(collect()) !== initialForm };
+  if (taskSaving) $$("input, textarea, select, button", form).forEach((control) => { control.disabled = true; });
   if (state.selected.addSub) {
     state.selected.addSub = false;
     const box = $("#f-title", form);
@@ -937,6 +1191,141 @@ async function addProject() {
 let noteRefs = null;
 let noteDraftKey = null;
 const NOTE_DRAFT_PREFIX = "localnote:draft:v1:";
+const noteHistory = { open: false, seq: 0, noteId: null, session: 0, versions: [], selected: null, detail: null, loading: false, restoring: false, writing: false, error: "" };
+
+function noteHistoryCurrent(seq) {
+  return noteHistory.open && noteHistory.seq === seq && noteHistory.noteId === state.notes.currentId && noteHistory.session === noteSession;
+}
+
+function renderNoteHistory() {
+  if (!noteHistory.open) return;
+  const h = noteHistory;
+  $("#note-history-status").textContent = h.restoring ? "正在保护当前稿并恢复…" : h.loading ? "正在读取历史…" : `${h.versions.length} 个历史版本 · ${state.notes.title}`;
+  $("#note-history-error").textContent = h.error;
+  $("#note-history-close").disabled = h.restoring;
+  $("#note-history-refresh").disabled = h.restoring || h.loading;
+  $("#note-history-restore").disabled = h.restoring || h.loading || !h.detail;
+  $("#note-history-list").replaceChildren(...h.versions.map((version) => el("button", {
+    class: "note-history-item", "aria-pressed": String(version.revision === h.selected), disabled: h.restoring,
+    onclick: () => selectNoteHistory(version.revision),
+  }, [
+    el("strong", { text: version.title }),
+    el("div", { class: "hint", text: `留存于 ${new Date(version.savedAt).toLocaleString("zh-CN", { hour12: false })}` }),
+    el("div", { class: "hint", text: `${version.words} 字 · ${version.revision.slice(0, 8)}` }),
+  ])));
+  const preview = $("#note-history-preview");
+  preview.setAttribute("aria-busy", String(h.loading));
+  if (h.detail) {
+    const { version, body } = h.detail;
+    preview.replaceChildren(
+      el("h3", { text: version.title }),
+      el("div", { class: "hint", text: `${version.pinned ? "已置顶 · " : ""}${version.tags.map((tag) => `#${tag}`).join(" ")}` }),
+      el("pre", { text: body || "（空正文）" }),
+    );
+  } else preview.replaceChildren(el("div", { class: "hint", text: h.loading ? "正在读取…" : h.error ? "历史暂不可用，请刷新后重试" : h.versions.length ? "选择左侧版本查看原文" : "暂无历史；下次保存内容变更时会留存当前版本" }));
+}
+
+async function loadNoteHistory() {
+  if (!noteHistory.open || noteHistory.restoring) return;
+  const seq = ++noteHistory.seq;
+  Object.assign(noteHistory, { loading: true, error: "", versions: [], selected: null, detail: null });
+  renderNoteHistory();
+  try {
+    const data = await api(`/api/notes/${encodeURIComponent(noteHistory.noteId)}/history`);
+    if (noteHistoryCurrent(seq)) noteHistory.versions = data.versions;
+  } catch (error) {
+    if (noteHistoryCurrent(seq)) noteHistory.error = `历史读取失败：${error.message}`;
+  } finally {
+    if (noteHistoryCurrent(seq)) { noteHistory.loading = false; renderNoteHistory(); }
+  }
+}
+
+async function selectNoteHistory(revision) {
+  if (!noteHistory.open || noteHistory.restoring) return;
+  const seq = ++noteHistory.seq;
+  Object.assign(noteHistory, { loading: true, error: "", selected: revision, detail: null });
+  renderNoteHistory();
+  try {
+    const data = await api(`/api/notes/${encodeURIComponent(noteHistory.noteId)}/history/${encodeURIComponent(revision)}`);
+    if (noteHistoryCurrent(seq)) noteHistory.detail = data;
+  } catch (error) {
+    if (noteHistoryCurrent(seq)) noteHistory.error = `版本读取失败：${error.message}`;
+  } finally {
+    if (noteHistoryCurrent(seq)) { noteHistory.loading = false; renderNoteHistory(); }
+  }
+}
+
+function showNoteHistory() {
+  if (!state.notes.currentId || noteNavigating || searchPanel.open || noteComposing) return;
+  if (noteHistory.open) return;
+  Object.assign(noteHistory, { open: true, noteId: state.notes.currentId, session: noteSession, returnFocus: document.activeElement });
+  $("#note-history-dialog").showModal();
+  void loadNoteHistory();
+}
+
+function closeNoteHistory() {
+  if (noteHistory.restoring) return;
+  noteHistory.open = false;
+  noteHistory.seq++;
+  $("#note-history-dialog").close();
+  if (noteHistory.returnFocus?.isConnected) noteHistory.returnFocus.focus();
+}
+
+async function restoreNoteHistory() {
+  const h = noteHistory;
+  if (!h.open || h.loading || h.restoring || !h.detail) return;
+  const seq = h.seq;
+  if (!noteHistoryCurrent(seq)) return;
+  if (noteNavigating || noteDeleting || noteComposing || taskSaving || state.selected?.id === "new" || taskDrawer?.changed()) {
+    h.error = "请先保存或关闭当前任务，或等待笔记操作完成，再恢复历史";
+    renderNoteHistory();
+    return;
+  }
+  const revision = h.detail.version.revision;
+  if (!confirm(`恢复「${h.detail.version.title}」的此历史版本？\n会先保存当前草稿，再恢复标题、标签、置顶与正文；恢复前的版本仍会保留。`)) return;
+  h.restoring = true;
+  h.error = "";
+  noteNavigating = true;
+  renderNoteHistory();
+  try {
+    if (!(await saveNote({ silent: true }))) throw new Error("当前草稿尚未保存，请关闭历史并处理草稿后再恢复");
+    if (!noteHistoryCurrent(seq)) return;
+    const version = state.notes.editVersion;
+    h.writing = true;
+    const data = await api(`/api/notes/${encodeURIComponent(h.noteId)}/history/${encodeURIComponent(revision)}/restore`, {
+      method: "POST", body: { baseRevision: state.notes.current.revision },
+    });
+    if (!noteHistoryCurrent(seq)) return;
+    if (version !== state.notes.editVersion) {
+      state.notes.conflict = true;
+      state.notes.saveError = "历史版本已恢复，但期间的新输入已保留为草稿；请下载草稿后重新载入";
+      persistNoteDraft();
+      updateNoteStatus();
+      throw new Error(state.notes.saveError);
+    }
+    setCurrentNote(data);
+    await loadNotes().catch((error) => toast(`历史版本已恢复，列表刷新失败：${error.message}`, true));
+    await render();
+    h.restoring = false;
+    closeNoteHistory();
+    $(".note-title")?.focus();
+    toast("已恢复历史版本，恢复前的内容仍保留在版本历史中");
+    return true;
+  } catch (error) {
+    if (h.open && h.seq === seq) h.error = error.message;
+    if (noteHistoryCurrent(seq) && error.code === "NOTE_CONFLICT") {
+      state.notes.conflict = true;
+      state.notes.saveError = "磁盘版本已变化，未恢复历史；请保留草稿并重新载入后再试";
+      updateNoteStatus();
+    }
+    return false;
+  } finally {
+    h.restoring = false;
+    h.writing = false;
+    noteNavigating = false;
+    renderNoteHistory();
+  }
+}
 
 function parseNoteDraft(raw) {
   const draft = JSON.parse(raw);
@@ -1168,7 +1557,7 @@ function markNoteDirty() {
 
 function scheduleAutoSave() {
   clearTimeout(autoSaveTimer);
-  if (noteComposing || noteDeleting || state.notes.conflict || state.notes.restoredDraft) return;
+  if (noteComposing || noteDeleting || noteHistory.writing || state.notes.conflict || state.notes.restoredDraft) return;
   autoSaveTimer = setTimeout(() => {
     if (state.notes.dirty && state.notes.currentId) saveNote({ silent: true });
   }, 2000);
@@ -1186,19 +1575,63 @@ function setCurrentNote(data) {
   });
 }
 
-async function changeNote(load) {
+async function changeNote(load, { fromTask = false, canNavigate = () => true } = {}) {
   if (noteNavigating) return;
   noteNavigating = true;
   try {
-    if (!(await saveNote({ silent: true }))) return;
+    if (!(await saveNote({ silent: true }))) {
+      if (fromTask) toast("当前笔记尚未保存，请先处理草稿后再跳转", true);
+      return;
+    }
+    const version = state.notes.editVersion;
     const data = await load();
     await loadNotes();
     if (!(await saveNote({ silent: true }))) return;
-    setCurrentNote(data);
+    if (!canNavigate()) return toast("跳转期间任务有变化，已保留当前任务，请保存后重试", true);
+    // 回跳同一笔记时，网络等待期间的新输入优先于旧响应。
+    if (data?.note.id !== state.notes.currentId || version === state.notes.editVersion) setCurrentNote(data);
     state.notes.showTrash = false;
+    if (fromTask) {
+      state.tab = "notes";
+      state.selected = null;
+      Object.assign(state.notes, { q: "", tag: "", pinned: "", list: null });
+    }
     await render();
+    if (state.notes.currentId) rememberOpened("note", state.notes.currentId);
+    return true;
   } catch (error) {
     toast(error.message, true);
+  } finally {
+    noteNavigating = false;
+  }
+}
+
+async function openSourceNote(id, canNavigate = () => true) {
+  await changeNote(async () => {
+    try {
+      return await api(`/api/notes/${encodeURIComponent(id)}`);
+    } catch (error) {
+      if (error.status === 404) throw new Error("来源笔记已删除或不存在，可到笔记回收站恢复；任务仍保留");
+      throw error;
+    }
+  }, { fromTask: true, canNavigate });
+}
+
+async function createTaskFromNote(text = "") {
+  if (noteNavigating || !state.notes.currentId) return;
+  if (taskSaving || state.selected?.id === "new" || taskDrawer?.changed()) return toast("请先保存或关闭当前任务，再生成新任务", true);
+  text = text.trim();
+  if (text.length > 4000) return toast("选中内容超过任务备注的 4000 字符上限，请缩小选区后再生成", true);
+  noteNavigating = true;
+  try {
+    if (!(await saveNote({ silent: true }))) return toast("请先保存笔记或处理未保存的草稿，再生成任务", true);
+    if (taskSaving || state.selected?.id === "new" || taskDrawer?.changed()) return toast("请先保存或关闭当前任务，再生成新任务", true);
+    state.selected = {
+      id: "new", sourceNoteId: state.notes.currentId, sourceNoteTitle: state.notes.title,
+      prefill: (text.split(/\r?\n/)[0] || state.notes.title).slice(0, 200), notesPrefill: text,
+    };
+    renderDrawer();
+    $("#f-title")?.focus();
   } finally {
     noteNavigating = false;
   }
@@ -1216,6 +1649,7 @@ async function newNote() {
 
 async function saveNote({ silent = false } = {}) {
   clearTimeout(autoSaveTimer);
+  if (noteHistory.writing) return false;
   if (saveFlight) return saveFlight;
   if (!state.notes.currentId || !state.notes.dirty) return true;
   if (noteComposing || noteDeleting || state.notes.conflict || (silent && state.notes.restoredDraft)) return false;
@@ -1368,7 +1802,8 @@ function noteListPane() {
   const search = el("input", {
     class: "field note-search",
     type: "search",
-    placeholder: "搜索笔记标题与正文",
+    placeholder: "搜索笔记标题、正文与标签",
+    maxlength: 80,
     value: state.notes.q,
     oninput: (e) => {
       state.notes.q = e.target.value;
@@ -1429,14 +1864,41 @@ function noteListItems() {
     const children = [
       el("div", { class: "note-item-title" }, [
         note.pinned ? el("span", { class: "pin", title: "已置顶", text: "📌" }) : null,
-        el("span", { text: note.title }),
+        el("span", {}, highlightedText(note.title, state.notes.q)),
       ]),
       el("div", { class: "note-item-sub", text: `${(note.updatedAt ?? "").slice(0, 16).replace("T", " ")} · ${note.words} 字` }),
-      note.excerpt ? el("div", { class: "note-item-ex", text: note.excerpt }) : null,
-      note.tags.length ? el("div", { class: "note-item-tags" }, note.tags.map((t) => el("span", { class: "pill", text: `#${t}` }))) : null,
+      (note.hit || note.excerpt) ? el("div", { class: "note-item-ex" }, highlightedText(note.hit || note.excerpt, state.notes.q)) : null,
+      note.tags.length ? el("div", { class: "note-item-tags" }, note.tags.map((t) => el("span", { class: "pill" }, highlightedText(`#${t}`, state.notes.q)))) : null,
     ].filter(Boolean);
     return el("div", { class: `note-item${selected ? " on" : ""}`, onclick: () => openNote(note.id) }, children);
   });
+}
+
+function noteSelectionText(editor, preview) {
+  const selection = window.getSelection();
+  if (selection && preview.contains(selection.anchorNode) && preview.contains(selection.focusNode) && !selection.isCollapsed) {
+    return selection.toString();
+  }
+  return editor.isConnected && document.activeElement === editor ? editor.value.slice(editor.selectionStart, editor.selectionEnd) : "";
+}
+
+function noteLinkedTasks() {
+  const tasks = (state.data?.tasks ?? []).filter((task) => task.sourceNoteId === state.notes.currentId && task.status !== "trashed");
+  const done = tasks.filter((task) => task.status === "done").length;
+  return el("div", { class: "note-linked-tasks" }, [
+    el("div", { class: "hint", text: tasks.length ? `关联任务 · ${done}/${tasks.length} 已完成` : "选中文字后点「生成任务」；未选中时使用笔记标题" }),
+    tasks.length ? el("div", { class: "note-linked-list" }, tasks.map((task) => el("button", {
+      class: "ghost note-task-link", onclick: () => {
+        if (state.selected?.id === task.id) return;
+        if (taskSaving || state.selected?.id === "new" || taskDrawer?.changed()) return toast("请先保存或关闭当前任务，再打开关联任务", true);
+        state.selected = { id: task.id };
+        renderDrawer();
+      },
+    }, [
+      el("span", { text: task.title }),
+      el("span", { class: "pill", text: { todo: "待办", doing: "进行中", done: "已完成" }[task.status] }),
+    ]))) : null,
+  ]);
 }
 
 function noteEditorPane() {
@@ -1498,7 +1960,13 @@ function noteEditorPane() {
       }),
     ]),
     el("div", { class: "pick note-toolbar" }, [
+      el("button", {
+        class: "ghost", text: "生成任务", title: "选中文字生成任务；未选中时使用笔记标题",
+        onmousedown: (event) => event.preventDefault(),
+        onclick: () => { if (session === noteSession) createTaskFromNote(noteSelectionText(editor, preview)); },
+      }),
       el("button", { class: "primary", text: "保存 (Ctrl+S)", onclick: saveNote }),
+      el("button", { class: "ghost", text: "版本历史", onclick: () => { if (session === noteSession) showNoteHistory(); } }),
       el("button", { class: "ghost", text: note.pinned ? "取消置顶" : "置顶", onclick: () => toggleNotePin(note) }),
       el("a", { class: "ghost", href: `/api/notes/${note.id}/export`, text: "导出此篇" }),
       el("button", { class: "ghost", text: "导出全部", onclick: () => { window.location.href = `/api/notes/export/all?${notesQuery()}`; } }),
@@ -1515,6 +1983,7 @@ function noteEditorPane() {
       el("button", { class: "ghost", text: "下载当前草稿", onclick: () => downloadNoteDraft() }),
       el("button", { class: "ghost", text: "重新载入磁盘版本", onclick: reloadNote }),
     ]),
+    noteLinkedTasks(),
     body,
     el("div", { class: "meta note-foot" }, [
       el("span", { id: "note-words", text: `${countChars(state.notes.body)} 字` }),
@@ -1619,6 +2088,48 @@ function restartPolling() {
 }
 
 function wire() {
+  $("#note-history-close").addEventListener("click", closeNoteHistory);
+  $("#note-history-dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeNoteHistory(); });
+  $("#note-history-refresh").addEventListener("click", loadNoteHistory);
+  $("#note-history-restore").addEventListener("click", restoreNoteHistory);
+  $("#global-search-open").addEventListener("click", showGlobalSearch);
+  $("#global-search-close").addEventListener("click", closeGlobalSearch);
+  $("#global-search-dialog").addEventListener("cancel", (e) => { e.preventDefault(); if (!searchPanel.composing) closeGlobalSearch(); });
+  $("#global-search-clear").addEventListener("click", () => {
+    $("#global-search-input").value = "";
+    scheduleGlobalSearch(true);
+    $("#global-search-input").focus();
+  });
+  $("#global-search-clear-recent").addEventListener("click", () => {
+    clearRecentOpened();
+    searchPanel.results.recent = [];
+    renderGlobalSearch();
+  });
+  $("#global-search-retry").addEventListener("click", () => { searchPanel.tasksRequest = null; void loadGlobalSearch(); });
+  const globalInput = $("#global-search-input");
+  globalInput.addEventListener("input", (e) => { if (!e.isComposing && !searchPanel.composing) scheduleGlobalSearch(); });
+  globalInput.addEventListener("compositionstart", () => {
+    searchPanel.composing = true;
+    clearTimeout(searchPanel.timer);
+    searchPanel.seq++;
+    searchPanel.loading = true;
+    renderGlobalSearch();
+  });
+  globalInput.addEventListener("compositionend", () => { searchPanel.composing = false; scheduleGlobalSearch(); });
+  globalInput.addEventListener("keydown", (e) => {
+    if (e.isComposing || searchPanel.composing || e.keyCode === 229) return;
+    const count = searchPanel.items.length;
+    if ((e.key === "ArrowDown" || e.key === "ArrowUp") && count) {
+      e.preventDefault();
+      searchPanel.active = (searchPanel.active + (e.key === "ArrowDown" ? 1 : -1) + count) % count;
+      updateSearchActive();
+      $(`#search-result-${searchPanel.active}`).scrollIntoView({ block: "nearest" });
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (count) void openSearchResult(searchPanel.items[searchPanel.active]);
+    }
+  });
   $("#search").addEventListener("input", (e) => {
     state.search = e.target.value;
     if (state.tab !== "tasks") state.tab = "tasks";
@@ -1635,11 +2146,17 @@ function wire() {
     toast(permission === "granted" ? "已开启系统通知" : "浏览器已拒绝通知权限", permission !== "granted");
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && state.selected) closeTask();
+    if (noteHistory.open) {
+      if ((e.ctrlKey || e.metaKey) && ["k", "s"].includes(e.key.toLowerCase())) e.preventDefault();
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
-      $("#search").focus();
+      showGlobalSearch();
+      return;
     }
+    if (searchPanel.open) return;
+    if (e.key === "Escape" && state.selected) closeTask();
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
       e.preventDefault();
       if (state.tab === "notes") saveNote();
@@ -1650,7 +2167,7 @@ function wire() {
     if (e.key === null || e.key.startsWith(NOTE_DRAFT_PREFIX)) refreshNoteDrafts();
   });
   window.addEventListener("beforeunload", (e) => {
-    if (state.notes.dirty || state.notes.saving) e.preventDefault();
+    if (state.notes.dirty || state.notes.saving || noteHistory.writing) e.preventDefault();
   });
   window.addEventListener("beforeinstallprompt", (e) => {
     e.preventDefault();
